@@ -23,7 +23,7 @@ def format_metrics(metrics):
     )
 
 
-def run_simple_eval_epoch(model, dataloader, num_classes, device, acc_only=False):
+def run_simple_eval_epoch(model, dataloader, num_classes, device, acc_only=False, run_interp_metrics=True, run_fairness_metrics=False):
     """
     Run a simple evaluation loop.
 
@@ -32,11 +32,15 @@ def run_simple_eval_epoch(model, dataloader, num_classes, device, acc_only=False
     - dataloader: The evaluation dataloader.
     - num_classes: The total number of classes in the evaluation dataloader, to initiate InterpretableTrainingMetrics.
 
+    - acc_only: If true, only accuracy metric will be calculated. Default=False. 
+    - interp_metrics: If true, interpretable metrics will be calculated. Default=True.
+    - fairness_metrics: If true, fairness metrics will be calculated. Default=False.
+
     Returns:
     - Dataframe of calculated metrics, {metric name: metric value}.
     """
 
-    interp_metrics = InterpretableTrainingMetrics(
+    interp_metrics = (InterpretableTrainingMetrics(
         num_classes=num_classes,
         # FIXME - this assumes that the model has a prototype_layer
         proto_per_class=(
@@ -50,10 +54,19 @@ def run_simple_eval_epoch(model, dataloader, num_classes, device, acc_only=False
         protopnet=model,
         device=device,
         acc_only=acc_only,
-    )
+    ) if run_interp_metrics else NullMetrics()) # Null metrics return empty dictionaries for calculated metrics
+
+    # TODO: finish adding the params
+    fairness_metrics = (InterpretableTrainingMetrics(
+        num_classes=num_classes,
+        # FIXME - this assumes that the model has a prototype_layer
+        proto_per_class=(
+            model.prototype_layer.num_prototypes_per_class if not acc_only else 1
+        ),) if run_fairness_metrics else NullMetrics()) # Null metrics return empty dictionaries for calculated metrics
 
     model.eval()
     interp_metrics.start_epoch("eval")
+    fairness_metrics.start_epoch("eval")
     with torch.no_grad():
         for _, batch_data_dict in tqdm(enumerate(dataloader)):
             batch_data_dict["img"] = batch_data_dict["img"].to(device)
@@ -62,8 +75,10 @@ def run_simple_eval_epoch(model, dataloader, num_classes, device, acc_only=False
                 batch_data_dict["img"], return_prototype_layer_output_dict=True
             )
             interp_metrics.update_all(batch_data_dict, output, phase="project")
+            fairness_metrics.update_all(batch_data_dict, output, phase="project")
 
         epoch_metrics_dict = interp_metrics.compute_dict()
+        epoch_metrics_dict.update(fairness_metrics.compute_dict()) # Update or have a new dict?
 
         for k, v in epoch_metrics_dict.items():
             # FIXME - update this when the interface for the metrics dict is more clearly defined.

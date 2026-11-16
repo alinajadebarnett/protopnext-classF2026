@@ -38,6 +38,37 @@ def add_gaussian_noise(norm_img, generator, std=0.2, eps=0.25):
     perturbed_img = norm_img + noise
     return perturbed_img
 
+def smoothed_edf(outcomes: torch.Tensor, groups: torch.Tensor,
+                 num_classes: int, concentration: float = 1.0) -> torch.Tensor:
+    """
+    Compute the smoothed empirical distribution function (EDF) for fairness metrics (Foulds et al., 2019).
+    For outcomes y and groups s: P(y|s) = (N_{y,s} + α) / (N_s + concentration)
+    where α = concentration / num_classes. 
+    The smoothed EDF is then computed as the maximum difference in log probabilities across groups.
+    
+    Parameters:
+    - outcomes (torch.Tensor): Tensor of model predictions or true labels.
+    - groups (torch.Tensor): Tensor indicating the group membership of each sample.
+    - num_classes (int): Number of classes in the classification task.
+    - concentration (float): Concentration parameter for smoothing. Default is 1.0.
+    """
+
+    group_ids, inverse = torch.unique(groups, return_inverse=True)
+    counts = torch.zeros(len(group_ids), num_classes,
+                         dtype=torch.float64, device=outcomes.device)
+    
+    # Count occurrences of each outcome for each group
+    counts.index_put_(
+        (inverse, outcomes.long()),
+        torch.ones_like(outcomes, dtype=torch.float64),
+        accumulate=True,
+    )
+    alpha = concentration / num_classes
+    probs = (counts + alpha) / (counts.sum(dim=1, keepdim=True) + concentration)
+    log_p = probs.log()
+    
+    return (log_p.max(dim=0).values - log_p.min(dim=0).values).max()
+
 
 # ============ METRICS ============
 class InterpMetrics(Metric):
@@ -358,3 +389,157 @@ class PartStabilityScore(InterpMetrics):
         stability_score = all_proto_stability.mean()
 
         return stability_score
+
+
+class FairnessMetrics(Metric):
+    """
+    Base class for fairness metrics.
+    This class wraps the torchmetrics.Metric class and provides a common interface for fairness metrics. 
+
+    Attributes:
+    - num_classes (int): The number of classes in the dataset.
+    - dist_sync_on_step (bool): torchmetrics parameter.
+    """
+
+    full_state_update = False
+
+    def __init__(self, num_classes, dist_sync_on_step=False):
+        """
+        Parameters:
+        - num_classes (int): The number of classes in the dataset.
+        - dist_sync_on_step (bool): torchmetrics parameter.
+        """
+
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.num_classes = num_classes
+        self.add_state("all_preds", default=[], dist_reduce_fx="cat")
+        self.add_state("all_targets", default=[], dist_reduce_fx="cat")
+        self.add_state("all_groups", default=[], dist_reduce_fx="cat")
+
+    def update(self, logits, targets, groups):
+        # Shared by all subclasses; override only if a metric needs different state.
+        self.all_preds.append(logits.argmax(dim=1))
+        self.all_targets.append(targets)
+        self.all_groups.append(groups)
+
+    def compute(self):
+        raise NotImplementedError("Subclasses must implement compute().")
+    
+    def get_group_acc(self):
+        predictions = torch.cat(self.all_preds)
+        targets = torch.cat(self.all_targets)
+        groups = torch.cat(self.all_groups)
+
+        is_privileged = groups == self.privileged_value
+        is_unprivileged = groups == self.unprivileged_value
+
+        if is_privileged.sum() == 0 or is_unprivileged.sum() == 0:
+            return torch.tensor(float("nan"), device=predictions.device), "nan", "nan"
+        
+        correct_all = (predictions == targets).double()
+        acc_priv = correct_all[is_privileged].mean()
+        acc_unpriv = correct_all[is_unprivileged].mean
+
+        return correct_all, acc_priv, acc_unpriv
+
+
+class DisparateImpact(FairnessMetrics):
+    """
+    A class for a disparate impact metrics. Child of FairnessMetrics.
+
+    Disparate impact (DI) is defined as:
+    acc(unprivileged) / acc(privileged). 
+    A DI value of 1 indicates perfect fairness, 
+    while values less than 1 indicate bias against the unprivileged group, 
+    and values greater than 1 indicate bias against the privileged group.
+
+    Attributes:
+    - num_classes (int): 
+    - priviledged_value (int):
+    - unprivileged_value (int):
+    - dist_sync_on_step (bool): torchmetrics parameter. 
+    """
+
+    def __init__(
+
+        self,
+        num_classes,
+        privileged_value=1,
+        unprivileged_value=0,
+        dist_sync_on_step=False,
+    ):
+        super().__init__(num_classes=num_classes, dist_sync_on_step=dist_sync_on_step)
+        self.privileged_value = privileged_value
+        self.unprivileged_value = unprivileged_value
+
+    def update(self, logits, targets, groups):
+        super().update(logits, targets, groups)
+
+    def compute(self):
+        correct_all, acc_priv, acc_unpriv = self.get_group_acc()
+
+        if acc_priv.isalpha() or acc_unpriv.isalpha():
+            return torch.tensor(float("nan"), device=predictions.device)
+
+        if acc_priv > 0:
+            return (acc_unpriv / acc_priv).item()
+        else:
+            return torch.tensor(float("nan"), device=predictions.device)
+        
+
+
+class EqualOpportunityDifference(FairnessMetrics):
+    """
+    acc(unprivileged) - acc(privileged). Fair value = 0.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        privileged_value=1,
+        unprivileged_value=0,
+        dist_sync_on_step=False,
+    ):
+        super().__init__(num_classes=num_classes, dist_sync_on_step=dist_sync_on_step)
+        self.privileged_value = privileged_value
+        self.unprivileged_value = unprivileged_value
+
+    def update(self, logits, targets, groups):
+        super().update(logits, targets, groups)
+
+    def compute(self):
+        correct_all, acc_priv, acc_unpriv = self.get_group_acc()
+        if acc_priv.isalpha() or acc_unpriv.isalpha():
+            return torch.tensor(float("nan"), device=predictions.device)
+        else:
+            return (acc_unpriv - acc_priv).item()
+
+
+class DifferentialFairnessBiasAmplification(FairnessMetrics):
+    """
+    eps_smoothed_edf(predictions) - eps_smoothed_edf(targets).
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        concentration=1.0,
+        dist_sync_on_step=False,
+    ):
+        super().__init__(num_classes=num_classes, dist_sync_on_step=dist_sync_on_step)
+        self.concentration = concentration
+
+    def update(self, logits, targets, groups):
+        super().update(logits, targets, groups)
+
+    def compute(self):
+        predictions = torch.cat(self.all_preds)
+        targets = torch.cat(self.all_targets)
+        groups = torch.cat(self.all_groups)
+
+        eps_pred = smoothed_edf(predictions, groups, self.num_classes)
+        eps_data = smoothed_edf(targets, groups, self.num_classes)
+
+        return (eps_pred - eps_data).data
+
+

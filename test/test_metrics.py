@@ -362,3 +362,8 @@ def test_pcs_perfect_score(
         score = pcs.compute()
 
     assert score == 1.0
+
+@pytest.mark.parametrize()
+def test_fairness_metrics(loaded_ppnet, seed):
+    
+    assert True, "Fairness metrics test not implemented yet."
