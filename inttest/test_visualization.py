@@ -52,3 +52,33 @@ def test_global_analysis(analysis_dir, shapes_2d_squeezenet1_1_path):
         {"WANDB_MODE": "dryrun"},
     )
     assert "Completed global analysis." in stdout
+
+
+def test_protopool_render_prototypes(
+    analysis_dir, shapes_2d_squeezenet1_1_protopool_path
+):
+    stdout, _ = python(
+        f"-u -m protopnet viz render-prototypes --model-path={shapes_2d_squeezenet1_1_protopool_path} --dataset=shapes_2d --output-dir={analysis_dir}",
+        {"WANDB_MODE": "dryrun"},
+    )
+    assert "Completed rendering of prototypes" in stdout
+
+
+def test_protopool_local_analysis(
+    analysis_dir, shapes_2d_squeezenet1_1_protopool_path
+):
+    stdout, _ = python(
+        f"-u -m protopnet viz local --model-path={shapes_2d_squeezenet1_1_protopool_path} --dataset=shapes_2d --sample=6 --output-dir={analysis_dir}",
+        {"WANDB_MODE": "dryrun"},
+    )
+    assert "Completed local analysis. Saved 6 analyses." in stdout
+
+
+def test_protopool_global_analysis(
+    analysis_dir, shapes_2d_squeezenet1_1_protopool_path
+):
+    stdout, _ = python(
+        f"-u -m protopnet viz global --model-path={shapes_2d_squeezenet1_1_protopool_path} --dataset=shapes_2d --output-dir={analysis_dir}",
+        {"WANDB_MODE": "dryrun"},
+    )
+    assert "Completed global analysis." in stdout

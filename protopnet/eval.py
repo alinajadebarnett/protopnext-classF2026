@@ -28,7 +28,7 @@ def run_simple_eval_epoch(model, dataloader, num_classes, device, acc_only=False
     Run a simple evaluation loop.
 
     Args:
-    - model: The model you want to evaluation. It assumes model has prototype_layer.num_prototypes_per_class.
+    - model: The model you want to evaluation. Unless acc_only, it uses model.metric_prototypes_per_class().
     - dataloader: The evaluation dataloader.
     - num_classes: The total number of classes in the evaluation dataloader, to initiate InterpretableTrainingMetrics.
 
@@ -38,10 +38,7 @@ def run_simple_eval_epoch(model, dataloader, num_classes, device, acc_only=False
 
     interp_metrics = InterpretableTrainingMetrics(
         num_classes=num_classes,
-        # FIXME - this assumes that the model has a prototype_layer
-        proto_per_class=(
-            model.prototype_layer.num_prototypes_per_class if not acc_only else 1
-        ),
+        proto_per_class=(model.metric_prototypes_per_class() if not acc_only else 1),
         # FIXME: these shouldn't be hardcoded
         # instead, the train_dataloaders should return an object
         part_num=15,

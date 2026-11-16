@@ -7,7 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .activations import ConvolutionalSharedOffsetPred, CosPrototypeActivation
+from .activations import (
+    ConvolutionalSharedOffsetPred,
+    CosPrototypeActivation,
+    L2Activation,
+)
 from .utilities.project_utilities import custom_unravel_index, hash_func
 
 
@@ -569,6 +573,166 @@ class PrototypeLayer(nn.Module):
         ]
 
         self.set_prototypes(new_prototypes)
+
+
+class ProtoPoolPrototypeLayer(PrototypeLayer):
+    """
+    Prototype layer for ProtoPool (https://arxiv.org/abs/2112.02902), where prototypes are
+    shared between classes. In addition to the log-similarity activations, the layer returns
+    the raw squared L2 distances, which the ProtoPool head mixes through the slot assignment.
+
+    During projection, each prototype is only pushed onto images of the classes that use it
+    (`prototype_allowed_classes`). Prototypes not used by any class search every image.
+    """
+
+    def __init__(
+        self,
+        num_prototypes: int,
+        num_classes: int,
+        activation_function: L2Activation,
+        latent_channels: int = 256,
+        prototype_dimension: tuple = (1, 1),
+        k_for_topk: int = 1,
+    ):
+        assert isinstance(
+            activation_function, L2Activation
+        ), "ProtoPool requires the L2 (log) activation, since it mixes raw distances."
+        super(ProtoPoolPrototypeLayer, self).__init__(
+            num_prototypes=num_prototypes,
+            activation_function=activation_function,
+            latent_channels=latent_channels,
+            prototype_dimension=prototype_dimension,
+            k_for_topk=k_for_topk,
+        )
+        self.num_classes = num_classes
+        self.register_buffer(
+            "prototype_allowed_classes",
+            torch.ones(num_prototypes, num_classes, dtype=torch.bool),
+        )
+
+    def set_prototype_allowed_classes(self, prototype_allowed_classes: torch.Tensor):
+        assert prototype_allowed_classes.shape == (
+            self.num_prototypes,
+            self.num_classes,
+        )
+        self.prototype_allowed_classes = prototype_allowed_classes.to(
+            device=self.prototype_tensors.device, dtype=torch.bool
+        )
+
+    def forward(self, x: torch.Tensor):
+        prototype_distances = self.activation_function.distances(
+            x, self.prototype_tensors
+        )
+        prototype_activations = self.activation_function.distances_to_activations(
+            prototype_distances
+        )
+
+        if not hasattr(self, "latent_spatial_size") or self.latent_spatial_size is None:
+            self.latent_spatial_size = (
+                prototype_activations.shape[-2],
+                prototype_activations.shape[-1],
+            )
+
+        return {
+            "prototype_activations": prototype_activations,
+            "prototype_distances": prototype_distances,
+        }
+
+    def prune_prototypes_by_index(self, prune_indices):
+        prune_set = set(prune_indices)
+        keep_indices = [
+            i for i in range(self.prototype_tensors.shape[0]) if i not in prune_set
+        ]
+        kept_allowed_classes = self.prototype_allowed_classes[keep_indices]
+        super(ProtoPoolPrototypeLayer, self).prune_prototypes_by_index(prune_indices)
+        self.prototype_allowed_classes = kept_allowed_classes
+
+    def update_prototypes_on_batch(
+        self,
+        protoL_input_torch,
+        start_index_of_search_batch,
+        global_max_proto_act,
+        global_max_fmap_patches,
+        global_prototype_meta: List[PrototypeFromSampleSource],
+        sample_ids,
+        labels,
+    ):
+        prototype_layer_stride = 1
+        updated_prototype_indices = {}
+
+        proto_act_torch = self.forward(
+            protoL_input_torch.to(self.prototype_tensors.device)
+        )["prototype_activations"]
+
+        allowed = self.prototype_allowed_classes.to(proto_act_torch.device)
+        # (batch, num_prototypes): may prototype j be pushed onto image i
+        search_mask = allowed[:, labels.to(allowed.device)].T.clone()
+        search_mask[:, ~allowed.any(dim=1)] = True
+
+        masked_proto_act = proto_act_torch.masked_fill(
+            ~search_mask[:, :, None, None], -float("inf")
+        )
+
+        prototype_shape = self.prototype_tensors.shape
+
+        for j in range(self.num_prototypes):
+            proto_act_j = masked_proto_act[:, j, :, :]
+            batch_max_proto_act_j = torch.amax(proto_act_j)
+
+            if batch_max_proto_act_j > global_max_proto_act[j]:
+                batch_argmax_proto_act_j = list(
+                    custom_unravel_index(
+                        torch.argmax(proto_act_j, axis=None), proto_act_j.shape
+                    )
+                )
+
+                img_index_in_batch = batch_argmax_proto_act_j[0]
+                fmap_height_start_index = (
+                    batch_argmax_proto_act_j[1] * prototype_layer_stride
+                )
+                fmap_width_start_index = (
+                    batch_argmax_proto_act_j[2] * prototype_layer_stride
+                )
+                fmap_height_end_index = fmap_height_start_index + prototype_shape[-2]
+                fmap_width_end_index = fmap_width_start_index + prototype_shape[-1]
+
+                batch_max_fmap_patch_j = protoL_input_torch[
+                    img_index_in_batch,
+                    :,
+                    fmap_height_start_index:fmap_height_end_index,
+                    fmap_width_start_index:fmap_width_end_index,
+                ]
+
+                global_prototype_meta[j] = PrototypeFromSampleSource(
+                    sample_id=sample_ids[img_index_in_batch],
+                    target=labels[img_index_in_batch].detach(),
+                    latent_patches=latent_prototype_patch_map(
+                        protoL_input_torch.shape[-2:],
+                        [
+                            (fmap_height_start_index, fmap_height_end_index),
+                            (fmap_width_start_index, fmap_width_end_index),
+                        ],
+                        device=self.prototype_tensors.device,
+                    ),
+                    embedding=batch_max_fmap_patch_j.detach(),
+                    img=None,
+                    hash=None,
+                )
+
+                global_max_proto_act[j] = batch_max_proto_act_j.detach()
+                global_max_fmap_patches[j] = batch_max_fmap_patch_j.detach()
+                updated_prototype_indices[j] = img_index_in_batch
+
+        return updated_prototype_indices
+
+    def get_extra_state(self):
+        extra_state = super(ProtoPoolPrototypeLayer, self).get_extra_state()
+        extra_state["num_classes"] = self.num_classes
+        return extra_state
+
+    def set_extra_state(self, state):
+        super(ProtoPoolPrototypeLayer, self).set_extra_state(state)
+        self.num_classes = state["num_classes"]
 
 
 class ClassAwarePrototypeLayer(PrototypeLayer):

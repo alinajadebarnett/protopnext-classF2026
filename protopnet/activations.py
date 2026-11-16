@@ -95,6 +95,18 @@ class L2Activation:
         x: torch.Tensor,
         prototype_tensors: torch.Tensor,
     ):
+        return self.distances_to_activations(self.distances(x, prototype_tensors))
+
+    def distances(
+        self,
+        x: torch.Tensor,
+        prototype_tensors: torch.Tensor,
+    ):
+        """
+        Squared L2 distance between each prototype and each latent patch.
+
+        Returns: tensor of shape (batch_size, num_prototypes, activation_height, activation_width).
+        """
         x2 = x**2
         ones = torch.ones(prototype_tensors.shape, requires_grad=False).to(
             prototype_tensors.device
@@ -114,10 +126,10 @@ class L2Activation:
 
         distances = x2_patch_sum + intermediate_result
 
-        distances = F.relu(distances)
-        activations = torch.log((distances + 1) / (distances + self.epsilon_val))
+        return F.relu(distances)
 
-        return activations
+    def distances_to_activations(self, distances: torch.Tensor):
+        return torch.log((distances + 1) / (distances + self.epsilon_val))
 
 
 class ExpL2Activation:

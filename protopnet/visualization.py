@@ -318,7 +318,12 @@ def local_analysis_plotter(
     truth,
     class_name_ref_dict,
     close_fig=True,
+    connection_class=None,
 ):
+    """
+    connection_class: if set, show each prototype's connection to this class instead of to the
+        class it is most strongly connected to (used when prototypes are shared between classes).
+    """
     anno_opts_cen = dict(
         xy=(0.4, 0.5), xycoords="axes fraction", va="center", ha="center"
     )
@@ -383,7 +388,11 @@ def local_analysis_plotter(
     for top_p in range(num_top_protos_viewed):
         # put info in place
         proto_idx = proto_indices[top_p]
-        proto_label = torch.argmax(class_connections[:, proto_idx]).item()
+        proto_label = (
+            connection_class
+            if connection_class is not None
+            else torch.argmax(class_connections[:, proto_idx]).item()
+        )
         sim_score = sim_scores[top_p]
         proto_class_str = str(
             class_name_ref_dict[proto_label]
@@ -472,12 +481,29 @@ def local_analysis(
         similarity_score_to_each_prototype = model_outputs[
             "similarity_score_to_each_prototype"
         ]
-        # batch size, k
-        top_k_proto_sim_scores, top_k_proto_indicies = torch.topk(
-            similarity_score_to_each_prototype, k=num_top_protos_viewed, dim=1
-        )
-
         predictions = torch.argmax(model_outputs["logits"], dim=1)
+
+        uses_effective_connections = hasattr(model, "effective_class_connections")
+        if uses_effective_connections:
+            # prototypes are shared between classes, so rank them by their contribution to the prediction
+            class_connections = model.effective_class_connections().detach()
+            contributions = similarity_score_to_each_prototype * class_connections[
+                predictions
+            ].to(similarity_score_to_each_prototype.device)
+            _, top_k_proto_indicies = torch.topk(
+                contributions, k=num_top_protos_viewed, dim=1
+            )
+            top_k_proto_sim_scores = torch.gather(
+                similarity_score_to_each_prototype, 1, top_k_proto_indicies
+            )
+        else:
+            class_connections = (
+                model.prototype_prediction_head.class_connection_layer.weight
+            )  # num_classes, num_protos
+            # batch size, k
+            top_k_proto_sim_scores, top_k_proto_indicies = torch.topk(
+                similarity_score_to_each_prototype, k=num_top_protos_viewed, dim=1
+            )
 
         for index_in_batch in range(batch_images.shape[0]):
             ori_img = batch_images[index_in_batch].detach()
@@ -523,11 +549,16 @@ def local_analysis(
                 .detach()
                 .cpu()
                 .numpy(),
-                class_connections=model.prototype_prediction_head.class_connection_layer.weight,  # num_classes, num_protos
+                class_connections=class_connections,
                 class_name_ref_dict=class_name_ref_dict,
                 num_top_protos_viewed=num_top_protos_viewed,
                 pred=predictions[index_in_batch].item(),
                 truth=labels[index_in_batch].item(),
+                connection_class=(
+                    predictions[index_in_batch].item()
+                    if uses_effective_connections
+                    else None
+                ),
             )
             del ori_img, proto_actmaps_on_image, proto_actmaps_on_image_normed
 

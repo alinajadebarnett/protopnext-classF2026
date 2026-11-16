@@ -94,6 +94,212 @@ class PrototypePredictionHead(LinearClassPrototypePredictionHead):
     pass
 
 
+class ProtoPoolPredictionHead(nn.Module):
+    """
+    Prediction head for ProtoPool (https://arxiv.org/abs/2112.02902).
+
+    Each class has `num_descriptive` slots. Each slot picks one of the shared prototypes through
+    the learned `proto_presence` tensor ([C, P, N]). Distances are mixed through the assignment,
+    turned into a focal similarity (log similarity of the min distance minus that of the mean
+    distance), and the C * N slot similarities feed a linear layer to C classes.
+
+    Assignment modes:
+        - hard_assignment: one-hot of `slot_prototype_index` (set at projection time)
+        - gumbel_scale == 0: softmax(proto_presence)
+        - training: gumbel_softmax(proto_presence * gumbel_scale, tau)
+        - eval: softmax(proto_presence * gumbel_scale / tau), the noise-free counterpart
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        num_prototypes: int,
+        num_descriptive: int,
+        tau: float = 0.5,
+        epsilon_val: float = 1e-4,
+        incorrect_class_connection: float = 0.0,
+    ):
+        super(ProtoPoolPredictionHead, self).__init__()
+        self.num_classes = num_classes
+        self.num_descriptive = num_descriptive
+        self.tau = tau
+        self.epsilon_val = epsilon_val
+        self.incorrect_class_connection = incorrect_class_connection
+
+        self.gumbel_scale = 0.0
+        self.hard_assignment = False
+
+        self.proto_presence = nn.Parameter(
+            torch.zeros(num_classes, num_prototypes, num_descriptive)
+        )
+        nn.init.xavier_normal_(self.proto_presence, gain=1.0)
+
+        slot_class_identity = torch.zeros(num_classes * num_descriptive, num_classes)
+        for j in range(num_classes * num_descriptive):
+            slot_class_identity[j, j // num_descriptive] = 1
+        self.register_buffer("slot_class_identity", slot_class_identity)
+
+        self.register_buffer(
+            "slot_prototype_index",
+            torch.zeros(num_classes, num_descriptive, dtype=torch.long),
+        )
+
+        self.class_connection_layer = nn.Linear(
+            num_classes * num_descriptive, num_classes, bias=False
+        )
+        positive_one_weights_locations = torch.t(slot_class_identity)
+        negative_one_weights_locations = 1 - positive_one_weights_locations
+        self.class_connection_layer.weight.data.copy_(
+            positive_one_weights_locations
+            + incorrect_class_connection * negative_one_weights_locations
+        )
+
+    @property
+    def num_prototypes(self) -> int:
+        return self.proto_presence.shape[1]
+
+    def _distance_to_similarity(self, distances: torch.Tensor) -> torch.Tensor:
+        return torch.log((distances + 1) / (distances + self.epsilon_val))
+
+    def slot_assignment(self) -> torch.Tensor:
+        """
+        Returns: the effective slot assignment of shape [C, P, N], normalized over P.
+        """
+        if self.hard_assignment:
+            return (
+                F.one_hot(self.slot_prototype_index, num_classes=self.num_prototypes)
+                .permute(0, 2, 1)
+                .to(self.proto_presence.dtype)
+            )
+        if self.gumbel_scale == 0:
+            return torch.softmax(self.proto_presence, dim=1)
+        if self.training:
+            return F.gumbel_softmax(
+                self.proto_presence * self.gumbel_scale, tau=self.tau, dim=1
+            )
+        return torch.softmax(self.proto_presence * self.gumbel_scale / self.tau, dim=1)
+
+    def slot_prototype_indices(self) -> torch.Tensor:
+        """
+        Returns: [C, N] index of the prototype used by each slot of each class.
+        """
+        if self.hard_assignment:
+            return self.slot_prototype_index
+        return torch.argmax(self.proto_presence, dim=1)
+
+    def set_hard_assignment(self, slot_prototype_index: torch.Tensor = None):
+        """
+        Freezes the assignment to the argmax of proto_presence (or the given [C, N] indices).
+        """
+        if slot_prototype_index is None:
+            slot_prototype_index = torch.argmax(self.proto_presence.detach(), dim=1)
+        self.slot_prototype_index = slot_prototype_index.to(
+            device=self.proto_presence.device, dtype=torch.long
+        )
+        self.hard_assignment = True
+
+    def effective_class_connections(self) -> torch.Tensor:
+        """
+        Returns: [C, P] class connection weights per prototype under the hard (argmax) assignment.
+            With hard assignment, logits == similarity_score_to_each_prototype @ W_eff.T.
+        """
+        weight = self.class_connection_layer.weight.view(
+            -1, self.num_classes, self.num_descriptive
+        )
+        assignment = F.one_hot(
+            self.slot_prototype_indices(), num_classes=self.num_prototypes
+        ).to(weight.dtype)
+        return torch.einsum("kcn,cnp->kp", weight, assignment)
+
+    def prune_prototypes_by_index(self, prune_indices):
+        prune_set = set(prune_indices)
+        keep_indices = [i for i in range(self.num_prototypes) if i not in prune_set]
+
+        old_to_new = torch.full(
+            (self.num_prototypes,),
+            -1,
+            dtype=torch.long,
+            device=self.slot_prototype_index.device,
+        )
+        old_to_new[keep_indices] = torch.arange(
+            len(keep_indices), device=old_to_new.device
+        )
+        if self.hard_assignment:
+            new_index = old_to_new[self.slot_prototype_index]
+            assert (
+                new_index >= 0
+            ).all(), "Cannot prune prototypes that are still assigned to a slot."
+            self.slot_prototype_index = new_index
+
+        requires_grad = self.proto_presence.requires_grad
+        self.proto_presence = nn.Parameter(
+            self.proto_presence.data[:, keep_indices, :].clone(),
+            requires_grad=requires_grad,
+        )
+
+    def forward(
+        self,
+        prototype_activations: torch.Tensor,
+        prototype_distances: torch.Tensor = None,
+        **kwargs,
+    ):
+        assert (
+            prototype_distances is not None
+        ), "ProtoPoolPredictionHead requires prototype_distances from the prototype layer."
+
+        flat_distances = prototype_distances.flatten(start_dim=2)
+        min_distances = flat_distances.amin(dim=-1)  # [B, P]
+        avg_distances = flat_distances.mean(dim=-1)  # [B, P]
+
+        proto_presence = self.slot_assignment()  # [C, P, N]
+
+        min_mixed = torch.einsum("bp,cpn->bcn", min_distances, proto_presence)
+        avg_mixed = torch.einsum("bp,cpn->bcn", avg_distances, proto_presence)
+        focal_similarity = self._distance_to_similarity(
+            min_mixed
+        ) - self._distance_to_similarity(avg_mixed)
+
+        logits = self.class_connection_layer(focal_similarity.flatten(start_dim=1))
+
+        output_dict = {"logits": logits}
+
+        if kwargs.get("return_min_distances", False):
+            output_dict["min_distances"] = min_distances
+
+        if kwargs.get("return_proto_presence", False):
+            output_dict["proto_presence"] = proto_presence
+
+        if kwargs.get("return_similarity_score_to_each_prototype", False) or kwargs.get(
+            "return_incorrect_class_prototype_activations", False
+        ):
+            output_dict["similarity_score_to_each_prototype"] = (
+                self._distance_to_similarity(min_distances)
+                - self._distance_to_similarity(avg_distances)
+            )
+
+        return output_dict
+
+    def get_extra_state(self):
+        return {
+            "gumbel_scale": self.gumbel_scale,
+            "hard_assignment": self.hard_assignment,
+            "tau": self.tau,
+            "epsilon_val": self.epsilon_val,
+            "num_classes": self.num_classes,
+            "num_descriptive": self.num_descriptive,
+            "incorrect_class_connection": self.incorrect_class_connection,
+        }
+
+    def set_extra_state(self, state):
+        self.gumbel_scale = state["gumbel_scale"]
+        self.hard_assignment = state["hard_assignment"]
+        self.tau = state["tau"]
+        self.epsilon_val = state["epsilon_val"]
+        self.num_classes = state["num_classes"]
+        self.num_descriptive = state["num_descriptive"]
+        self.incorrect_class_connection = state["incorrect_class_connection"]
+
+
 class ProtoTreePredictionHead(nn.Module):
     class Node(nn.Module):
         def __init__(self, index: int):

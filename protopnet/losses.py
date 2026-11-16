@@ -129,9 +129,12 @@ class L1CostClassConnectionLayer(nn.Module):
 
     def forward(self, model: "ProtoPNet"):
         if self.negative_classes_only:
-            weights = model.prototype_prediction_head.class_connection_layer.weight * (
-                1 - model.prototype_prediction_head.prototype_class_identity.T
-            )
+            head = model.prototype_prediction_head
+            # ProtoPool connects class slots (not prototypes) to classes
+            class_identity = getattr(head, "slot_class_identity", None)
+            if class_identity is None:
+                class_identity = head.prototype_class_identity
+            weights = head.class_connection_layer.weight * (1 - class_identity.T)
         else:
             weights = model.prototype_prediction_head.class_connection_layer.weight
 
@@ -192,6 +195,138 @@ class SeparationCost(nn.Module):
         separation_cost = torch.mean(incorrect_class_prototype_activations)
 
         return separation_cost
+
+
+class MixupCrossEntropyCost(nn.Module):
+    """
+    Cross entropy for mixup batches: lambda * CE(logits, target) + (1 - lambda) * CE(logits, target_b).
+    Reduces to plain cross entropy when the batch carries no mixup keys (e.g. during eval).
+    """
+
+    def __init__(self):
+        super(MixupCrossEntropyCost, self).__init__()
+        self.name = "mixup_cross_entropy"
+        self.required_forward_results = {"logits", "target"}
+        self.optional_forward_results = {"mixup_target_b", "mixup_lambda"}
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        mixup_target_b: torch.Tensor = None,
+        mixup_lambda: float = None,
+        **kwargs,
+    ):
+        cross_entropy = F.cross_entropy(logits, target)
+        if mixup_target_b is None or mixup_lambda is None:
+            return cross_entropy
+        return mixup_lambda * cross_entropy + (1 - mixup_lambda) * F.cross_entropy(
+            logits, mixup_target_b
+        )
+
+
+def _protopool_masked_min_distance(
+    min_distances: torch.Tensor, selected_prototypes: torch.Tensor
+) -> torch.Tensor:
+    """
+    Mean over the batch of the smallest distance among the selected prototypes.
+    Rows with no selected prototype are skipped.
+    """
+    masked = min_distances.masked_fill(~selected_prototypes, float("inf"))
+    closest = masked.amin(dim=1)
+    has_selection = selected_prototypes.any(dim=1)
+    if not has_selection.any():
+        return min_distances.sum() * 0.0
+    return closest[has_selection].mean()
+
+
+def _protopool_is_hard_assignment(proto_presence: torch.Tensor) -> bool:
+    return bool(torch.all((proto_presence == 0) | (proto_presence == 1)))
+
+
+def _topk_mask(scores: torch.Tensor, k: int) -> torch.Tensor:
+    k = max(1, min(k, scores.shape[1]))
+    _, idx = torch.topk(scores, k, dim=1)
+    mask = torch.zeros_like(scores, dtype=torch.bool)
+    mask.scatter_(1, idx, True)
+    return mask
+
+
+class ProtoPoolClusterCost(nn.Module):
+    """
+    Distance-based cluster cost from ProtoPool (`dist_loss` with top_k = num_descriptive):
+    the distance from each sample to the closest of the top-N prototypes assigned to its class.
+    Use a positive coefficient. Under hard assignment the exact assigned set is used, so a prototype
+    selected by two slots does not pull an unrelated prototype into the top-N.
+    """
+
+    def __init__(self):
+        super(ProtoPoolClusterCost, self).__init__()
+        self.name = "protopool_cluster"
+        self.required_forward_results = {"min_distances", "proto_presence", "target"}
+
+    def forward(
+        self,
+        min_distances: torch.Tensor,
+        proto_presence: torch.Tensor,
+        target: torch.Tensor,
+        **kwargs,
+    ):
+        class_presence = proto_presence[target]  # [B, P, N]
+        prototype_mass = class_presence.sum(dim=-1).detach()  # [B, P]
+        if _protopool_is_hard_assignment(proto_presence):
+            selected = prototype_mass > 0
+        else:
+            selected = _topk_mask(prototype_mass, class_presence.shape[-1])
+        return _protopool_masked_min_distance(min_distances, selected)
+
+
+class ProtoPoolSeparationCost(nn.Module):
+    """
+    Distance-based separation cost from ProtoPool (`dist_loss` on the inverted assignment with
+    top_k = num_prototypes - num_descriptive): the distance from each sample to the closest prototype
+    not assigned to its class. Use a negative coefficient.
+    """
+
+    def __init__(self):
+        super(ProtoPoolSeparationCost, self).__init__()
+        self.name = "protopool_separation"
+        self.required_forward_results = {"min_distances", "proto_presence", "target"}
+
+    def forward(
+        self,
+        min_distances: torch.Tensor,
+        proto_presence: torch.Tensor,
+        target: torch.Tensor,
+        **kwargs,
+    ):
+        class_presence = proto_presence[target]  # [B, P, N]
+        num_prototypes, num_descriptive = class_presence.shape[1:]
+        if _protopool_is_hard_assignment(proto_presence):
+            selected = class_presence.sum(dim=-1) == 0
+        else:
+            inverted_mass = (1 - class_presence).sum(dim=-1).detach()
+            selected = _topk_mask(inverted_mass, num_prototypes - num_descriptive)
+        return _protopool_masked_min_distance(min_distances, selected)
+
+
+class SlotOrthogonalityLoss(nn.Module):
+    """
+    ProtoPool slot orthogonality: the summed cosine similarity between the prototype distributions
+    of every pair of slots within a class, divided by N * C, minus 1 (so it is 0 when the slots of
+    each class are mutually orthogonal).
+    """
+
+    def __init__(self):
+        super(SlotOrthogonalityLoss, self).__init__()
+        self.name = "slot_orthogonality"
+
+    def forward(self, model: "ProtoPNet"):
+        proto_presence = model.prototype_prediction_head.proto_presence  # [C, P, N]
+        num_classes, _, num_descriptive = proto_presence.shape
+        normalized = F.normalize(proto_presence, p=2, dim=1, eps=1e-8)
+        slot_cosine = torch.einsum("cpn,cpm->cnm", normalized, normalized)
+        return slot_cosine.sum() / (num_descriptive * num_classes) - 1
 
 
 class AverageSeparationCost(nn.Module):

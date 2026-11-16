@@ -187,6 +187,36 @@ python -m protopnet eval models.csv --dataset cub200 --output results.csv
 python -m protopnet visualization model.pth --dataset cub200
 ```
 
+### ProtoPool
+
+`train-protopool` trains ProtoPool [8], ported from [gmum/ProtoPool](https://github.com/gmum/ProtoPool).
+Its prototypes are shared between classes: each class has `--num-descriptive` slots, and each slot learns which prototype of the pool it uses, through a Gumbel-softmax whose scale is annealed over `--gumbel-epochs`.
+At projection the assignment becomes hard (argmax), and each prototype is pushed only onto images of the classes that use it.
+
+The schedule is warm-up (frozen backbone), joint, one projection, then last-layer fine-tuning.
+`--iterative-push-cycles N` adds N extra (last-only, joint, project) cycles after the first projection, with the slot assignment frozen.
+
+Paper-like hyperparameters (the defaults follow the original code, see below):
+
+```bash
+# CUB-200-2011
+python -m protopnet train-protopool --dataset cub200_cropped --backbone "resnet50[pretraining=inaturalist]" \
+    --num-prototypes 202 --num-descriptive 10 --proto-channels 256
+
+# Stanford Cars
+python -m protopnet train-protopool --dataset cars_cropped --backbone resnet50 \
+    --num-prototypes 195 --num-descriptive 10 --proto-channels 128
+```
+
+Known differences from the original run:
+
+- The defaults follow the original code (`--lr 1e-3`), not supplementary Table 6 of the paper. The paper uses warm-up and joint learning rates of 1.5e-3 (add-on, pool) and 5e-5 (backbone), halves the joint learning rate every 5 epochs, and fine-tunes the last layer for 15 epochs at 1e-4 without weight decay or decay schedule. `--lr 5e-4 --joint-lr-gamma 0.5 --last-only-epochs 15 --last-only-lr-gamma 1 --last-only-weight-decay 0` reproduces those, except the last-layer learning rate becomes 5e-5.
+- The original augments the training set offline (many copies of each image, with ProtoPNet's `img_aug.py`), so one of its epochs is many more steps than a ProtoPNext epoch, which augments on the fly. Epoch counts (warm-up, joint, Gumbel annealing, StepLR steps) do not carry over 1:1; scale them with `--phase-multiplier`.
+- The original selects its best model and early-stops on the test set and decays the learning rate on plateaus. ProtoPNext early-stops on the validation set and has no plateau decay.
+- The original applies Gumbel noise at evaluation time. Here evaluation uses the noise-free `softmax(proto_presence * scale / tau)`.
+- The original uses the 180-epoch iNaturalist ResNet-50 checkpoint; ProtoPNext loads the 90-epoch one.
+- The original's unused `alfa` parameter (`--use_thresh`) is omitted.
+
 ## Datasets
 
 Available datasets:
@@ -233,4 +263,5 @@ For example, the `ProtoPNetTrainingSchedule` has the following layout:
 5. Wang et al. Learning support and trivial prototypes for interpretable image classification. ICCV, 2023
 6. Huang et al. Evaluation and improvement of interpretability for self-explainable part-prototype networks. ICCV, 2023.
 7. Willard et al. This looks better than that: Better interpretable models with protopnext. arXiv preprint arXiv:2406.14675 (2024).
+8. Rymarczyk et al. Interpretable image classification with differentiable prototypes assignment. ECCV, 2022.
 8. Moffett et al. Cosine Similarity is Almost All You Need (for Prototypical-Part Models). WACV, 2026.

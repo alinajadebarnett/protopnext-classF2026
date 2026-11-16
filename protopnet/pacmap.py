@@ -19,6 +19,21 @@ from . import datasets
 log = logging.getLogger(__name__)
 
 
+def prototype_labels_and_num_classes(ppnet) -> Tuple[torch.Tensor, int]:
+    """
+    Returns the class label used to color each prototype and the number of classes.
+    Models whose prototypes are shared between classes (e.g. ProtoPool) provide
+    `prototype_primary_classes()`; otherwise the one-hot prototype class identity is used.
+    """
+    if hasattr(ppnet, "prototype_primary_classes"):
+        return ppnet.prototype_primary_classes()
+    prototype_class_identity = ppnet.prototype_prediction_head.prototype_class_identity
+    return (
+        torch.argmax(prototype_class_identity, dim=1),
+        prototype_class_identity.shape[1],
+    )
+
+
 def feature_extract(
     dataloader,
     model_path,
@@ -410,7 +425,7 @@ def generate_pacmap(
 
     # no forward inference, so just load on CPU
     ppnet = torch.load(model_path, map_location=device)
-    num_classes = ppnet.prototype_prediction_head.prototype_class_identity.shape[1]
+    proto_labels, num_classes = prototype_labels_and_num_classes(ppnet)
 
     prototype_vectors = ppnet.prototype_layer.prototype_tensors.squeeze()
     prototype_vectors = prototype_vectors.detach().cpu().numpy()
@@ -440,10 +455,6 @@ def generate_pacmap(
 
     for i in range(len(labels)):
         new_labels += [labels[i] for _ in range(num_repeats)]
-
-    proto_labels = torch.argmax(
-        ppnet.prototype_prediction_head.prototype_class_identity, dim=1
-    )
 
     labels = np.array(new_labels)
     proto_labels = proto_labels.cpu().numpy()

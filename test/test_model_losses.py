@@ -15,7 +15,63 @@ from protopnet.losses import (
     OrthogonalityLoss,
     SeparationCost,
 )
-from protopnet.model_losses import ProtoPNetLoss, loss_for_coefficients
+from protopnet.model_losses import (
+    LinearBatchLoss,
+    ProtoPNetLoss,
+    loss_for_coefficients,
+)
+
+
+def test_protopool_terms():
+    coefs = {
+        "mixup_cross_entropy": 1.0,
+        "protopool_cluster": 0.8,
+        "protopool_separation": -0.08,
+        "slot_orthogonality": 1.0,
+        "l1": 1e-4,
+    }
+    loss = loss_for_coefficients(coefs)
+
+    batch_names = {
+        term.loss.name: term.coefficient for term in loss.batch_loss.batch_losses
+    }
+    model_names = {
+        term.loss.name: term.coefficient
+        for term in loss.model_regularization.model_losses
+    }
+    assert batch_names == {
+        "mixup_cross_entropy": 1.0,
+        "protopool_cluster": 0.8,
+        "protopool_separation": -0.08,
+    }
+    assert model_names == {"slot_orthogonality": 1.0, "l1": 1e-4}
+    assert loss.batch_loss.required_forward_results() == {
+        "logits",
+        "target",
+        "min_distances",
+        "proto_presence",
+    }
+
+
+class _OptionalKeyLoss(nn.Module):
+    name = "optional_key_loss"
+    required_forward_results = {"logits"}
+    optional_forward_results = {"extra"}
+
+    def forward(self, logits, extra=None):
+        return logits.sum() * (1.0 if extra is None else extra)
+
+
+def test_linear_batch_loss_passes_optional_keys_when_present():
+    batch_loss = LinearBatchLoss([LossTerm(loss=_OptionalKeyLoss(), coefficient=1.0)])
+    logits = torch.ones(2, 2)
+
+    without_extra, _ = batch_loss(logits=logits, unrelated=1)
+    with_extra, _ = batch_loss(logits=logits, extra=3.0)
+
+    assert without_extra.item() == pytest.approx(4.0)
+    assert with_extra.item() == pytest.approx(12.0)
+    assert batch_loss.required_forward_results() == {"logits"}
 
 
 def test_cross_entropy_only():

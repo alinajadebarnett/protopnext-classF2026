@@ -418,6 +418,7 @@ class ClassificationInferencePhase(_NoGradPhaseMixin):
             "separation",
             "fine_annotation",
             "accu",
+            "slot_orthogonality",
         ]
 
         for k, v in epoch_metrics_dict.items():
