@@ -11,7 +11,7 @@ import torch
 from tqdm.auto import tqdm
 
 from . import datasets
-from .train.metrics import InterpretableTrainingMetrics
+from .train.metrics import InterpretableTrainingMetrics, FairnessTrainingMetrics, NullMetrics
 from .utilities.trainer_utilities import is_single_valued_metric
 
 log = logging.getLogger(__name__)
@@ -56,13 +56,15 @@ def run_simple_eval_epoch(model, dataloader, num_classes, device, acc_only=False
         acc_only=acc_only,
     ) if run_interp_metrics else NullMetrics()) # Null metrics return empty dictionaries for calculated metrics
 
-    # TODO: finish adding the params
-    fairness_metrics = (InterpretableTrainingMetrics(
+    fairness_metrics = (FairnessTrainingMetrics(
         num_classes=num_classes,
-        # FIXME - this assumes that the model has a prototype_layer
-        proto_per_class=(
-            model.prototype_layer.num_prototypes_per_class if not acc_only else 1
-        ),) if run_fairness_metrics else NullMetrics()) # Null metrics return empty dictionaries for calculated metrics
+        ## TODO: Fill these in with the actual privileged and unprivileged class names
+        privileged_classes = [1, 2, 3], 
+        unprivileged_classes = [4, 5, 6],
+        concentration=1.0,
+        device="cpu",
+
+        ) if run_fairness_metrics else NullMetrics()) # Null metrics return empty dictionaries for calculated metrics
 
     model.eval()
     interp_metrics.start_epoch("eval")

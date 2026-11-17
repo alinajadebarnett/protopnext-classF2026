@@ -11,7 +11,7 @@ from torchmetrics.classification import (
     MulticlassROC,
 )
 
-from ..metrics import PartConsistencyScore, PartStabilityScore, add_gaussian_noise
+from ..metrics import PartConsistencyScore, PartStabilityScore, add_gaussian_noise, DisparateImpact, EqualOpportunityDifference, DifferentialFairness
 from ..prototypical_part_model import ProtoPNet
 from ..utilities.trainer_utilities import predicated_extend
 
@@ -426,25 +426,25 @@ class InterpretableTrainingMetrics(TrainingMetrics):
 
         return result_dict
 
-class FairnessMetrics(TrainingMetrics):
+class FairnessTrainingMetrics(TrainingMetrics):
     """
     Implementation of fairness metrics for training. 
-    It includes DisparateImpact, EqualOpportunityDifference, and DifferentialFairnessBiasAmplification metrics.
+    It includes DisparateImpact, EqualOpportunityDifference, and DifferentialFairness metrics.
     """
     def __init__(
         self,
         num_classes,
-        privileged_value=1,
-        unprivileged_value=0,
+        privileged_classes, 
+        unprivileged_classes,
         concentration=1.0,
         device="cpu",
     ):
         """
         Args:
             num_classes (int): The number of classes in the dataset.
-            privileged_value (int, optional): The value representing the privileged group. Defaults to 1.
-            unprivileged_value (int, optional): The value representing the unprivileged group. Defaults to 0.
-            concentration (float, optional): The concentration parameter for DifferentialFairnessBiasAmplification. Defaults to 1.0.
+            priviledged_classes (list): numerical list of the priviledged classes, corresponding to the class lables
+            unprivileged_classes (list): numerical list of the unpriviledged classes, corresponding to the class lables
+            concentration (float, optional): The concentration parameter for DifferentialFairness. Defaults to 1.0.
             device (str or torch.device, optional): The device to run the metrics on. Defaults to "cpu".
         """
         super().__init__(
@@ -452,19 +452,19 @@ class FairnessMetrics(TrainingMetrics):
                 TrainingMetric(
                     name="disparate_impact",
                     metric=DisparateImpact(
-                        num_classes, privileged_value, unprivileged_value
+                        num_classes, privileged_classes, unprivileged_classes,
                     ),
                 ),
                 TrainingMetric(
                     name="equal_opportunity_difference",
                     metric=EqualOpportunityDifference(
-                        num_classes, privileged_value, unprivileged_value
+                        num_classes, privileged_classes, unprivileged_classes,
                     ),
                 ),
                 TrainingMetric(
-                    name="differential_fairness_bias_amplification",
-                    metric=DifferentialFairnessBiasAmplification(
-                        num_classes, concentration
+                    name="differential_fairness",
+                    metric=DifferentialFairness(
+                        num_classes, privileged_classes, unprivileged_classes, concentration
                     ),
                 ),
             ],
@@ -474,14 +474,9 @@ class FairnessMetrics(TrainingMetrics):
     def update_all(self, forward_args: dict, forward_outputs: dict, phase: str):
         """
         Update all the fairness metrics.
-        'protected_attribute' must be present in forward_args for fairness metrics to be updated.
         """
-
-        if "protected_attribute" not in forward_args:
-            return
         for training_metric in self.metrics.values():
             training_metric.metric.update(
                 logits=forward_outputs["logits"],
                 targets=forward_args["target"],
-                groups=forward_args["protected_attribute"],
             )

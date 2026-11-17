@@ -410,17 +410,14 @@ class FairnessMetrics(Metric):
         - dist_sync_on_step (bool): torchmetrics parameter.
         """
 
-        super().__init__(dist_sync_on_step=dist_sync_on_step)
-        self.num_classes = num_classes
+        super().__init__(dist_sync_on_step=dist_sync_on_step, num_classes = num_classes)
         self.add_state("all_preds", default=[], dist_reduce_fx="cat")
         self.add_state("all_targets", default=[], dist_reduce_fx="cat")
-        self.add_state("all_groups", default=[], dist_reduce_fx="cat")
 
-    def update(self, logits, targets, groups):
+    def update(self, logits, targets):
         # Shared by all subclasses; override only if a metric needs different state.
         self.all_preds.append(logits.argmax(dim=1))
         self.all_targets.append(targets)
-        self.all_groups.append(groups)
 
     def compute(self):
         raise NotImplementedError("Subclasses must implement compute().")
@@ -428,35 +425,38 @@ class FairnessMetrics(Metric):
     def get_group_acc(self):
         predictions = torch.cat(self.all_preds)
         targets = torch.cat(self.all_targets)
-        groups = torch.cat(self.all_groups)
 
-        is_privileged = groups == self.privileged_value
-        is_unprivileged = groups == self.unprivileged_value
+        priv_classes = self.privileged_classes.to(targets.device)
+        unpriv_classes = self.unprivileged_classes.to(targets.device)
+
+        is_privileged = torch.isin(targets, priv_classes)
+        is_unprivileged = torch.isin(targets, unpriv_classes)
 
         if is_privileged.sum() == 0 or is_unprivileged.sum() == 0:
-            return torch.tensor(float("nan"), device=predictions.device), "nan", "nan"
+            nan_val = torch.tensor(float("nan"), device=predictions.device)
+            return nan_val, nan_val, nan_val, predictions
         
         correct_all = (predictions == targets).double()
         acc_priv = correct_all[is_privileged].mean()
-        acc_unpriv = correct_all[is_unprivileged].mean
+        acc_unpriv = correct_all[is_unprivileged].mean()
 
-        return correct_all, acc_priv, acc_unpriv
+        return correct_all, acc_priv, acc_unpriv, predictions
 
 
 class DisparateImpact(FairnessMetrics):
     """
-    A class for a disparate impact metrics. Child of FairnessMetrics.
+    A class for a disparate impact metrics. Child of FairnessMetrics. 
 
     Disparate impact (DI) is defined as:
-    acc(unprivileged) / acc(privileged). 
-    A DI value of 1 indicates perfect fairness, 
+    acc(unprivileged) / acc(privileged). (Feldman et al., 2014) 
+    Fair value = 1, 
     while values less than 1 indicate bias against the unprivileged group, 
     and values greater than 1 indicate bias against the privileged group.
 
     Attributes:
     - num_classes (int): 
-    - priviledged_value (int):
-    - unprivileged_value (int):
+    - priviledged_classes (list): numerical list of the priviledged classes, corresponding to the class lables
+    - unprivileged_classes (list): numerical list of the unpriviledged classes, corresponding to the class lables
     - dist_sync_on_step (bool): torchmetrics parameter. 
     """
 
@@ -464,21 +464,21 @@ class DisparateImpact(FairnessMetrics):
 
         self,
         num_classes,
-        privileged_value=1,
-        unprivileged_value=0,
+        privileged_classes,
+        unprivileged_classes,
         dist_sync_on_step=False,
     ):
         super().__init__(num_classes=num_classes, dist_sync_on_step=dist_sync_on_step)
-        self.privileged_value = privileged_value
-        self.unprivileged_value = unprivileged_value
+        self.register_buffer("privileged_classes", torch.tensor(privileged_classes))
+        self.register_buffer("unprivileged_classes", torch.tensor(unprivileged_classes))
 
-    def update(self, logits, targets, groups):
-        super().update(logits, targets, groups)
+    def update(self, logits, targets):
+        super().update(logits, targets)
 
     def compute(self):
-        correct_all, acc_priv, acc_unpriv = self.get_group_acc()
+        _, acc_priv, acc_unpriv, predictions = self.get_group_acc()
 
-        if acc_priv.isalpha() or acc_unpriv.isalpha():
+        if torch.isnan(acc_priv) or torch.isnan(acc_unpriv):
             return torch.tensor(float("nan"), device=predictions.device)
 
         if acc_priv > 0:
@@ -490,56 +490,98 @@ class DisparateImpact(FairnessMetrics):
 
 class EqualOpportunityDifference(FairnessMetrics):
     """
-    acc(unprivileged) - acc(privileged). Fair value = 0.
+    A class for a equal opportunity difference metrics. Child of FairnessMetrics.
+
+    acc(unprivileged) - acc(privileged). Fair value = 0. (Hardt et al., 2016)
+    Positive values indicate bias against the privileged group, 
+    while negative values indicate bias against the unprivileged group.
+
+    Attributes:
+    - num_classes (int): 
+    - priviledged_classes (list): numerical list of the priviledged classes, corresponding to the class lables
+    - unprivileged_classes (list): numerical list of the unpriviledged classes, corresponding to the class lables
+    - dist_sync_on_step (bool): torchmetrics parameter. 
     """
 
     def __init__(
         self,
         num_classes,
-        privileged_value=1,
-        unprivileged_value=0,
+        privileged_classes,
+        unprivileged_classes,
         dist_sync_on_step=False,
     ):
         super().__init__(num_classes=num_classes, dist_sync_on_step=dist_sync_on_step)
-        self.privileged_value = privileged_value
-        self.unprivileged_value = unprivileged_value
+        self.register_buffer("privileged_classes", torch.tensor(privileged_classes))
+        self.register_buffer("unprivileged_classes", torch.tensor(unprivileged_classes))
 
-    def update(self, logits, targets, groups):
-        super().update(logits, targets, groups)
+    def update(self, logits, targets):
+        super().update(logits, targets)
 
     def compute(self):
-        correct_all, acc_priv, acc_unpriv = self.get_group_acc()
-        if acc_priv.isalpha() or acc_unpriv.isalpha():
+        _, acc_priv, acc_unpriv, predictions = self.get_group_acc()
+        if torch.isnan(acc_priv) or torch.isnan(acc_unpriv):
             return torch.tensor(float("nan"), device=predictions.device)
         else:
             return (acc_unpriv - acc_priv).item()
 
 
-class DifferentialFairnessBiasAmplification(FairnessMetrics):
+class DifferentialFairness(FairnessMetrics):
     """
-    eps_smoothed_edf(predictions) - eps_smoothed_edf(targets).
+    (Islam et al., 2020)
+    Differential fairness (DF) is defined as:
+    Smoothed empirical differential fairness epsilon (see smoothed_edf()) of the correct/incorrect
+    outcome across privileged vs. unprivileged class groups. Fair value = 0.
+
+    Differential fairness is symmetrical, meaning it does not indicate which group is favored. 
+    
+    Attributes:
+    - num_classes (int): The number of classes
+    - priviledged_classes (list): numerical list of the priviledged classes, corresponding to the class lables
+    - unprivileged_classes (list): numerical list of the unpriviledged classes, corresponding to the class lables
+    - concentration (float): smoothing parameter for smoothed_edf().
+    - dist_sync_on_step (bool): torchmetrics parameter. 
     """
 
     def __init__(
         self,
         num_classes,
+        privileged_classes,
+        unprivileged_classes,
         concentration=1.0,
         dist_sync_on_step=False,
     ):
         super().__init__(num_classes=num_classes, dist_sync_on_step=dist_sync_on_step)
         self.concentration = concentration
+        self.register_buffer("privileged_classes", torch.tensor(privileged_classes))
+        self.register_buffer("unprivileged_classes", torch.tensor(unprivileged_classes))
 
-    def update(self, logits, targets, groups):
-        super().update(logits, targets, groups)
+    def update(self, logits, targets):
+        super().update(logits, targets)
 
     def compute(self):
-        predictions = torch.cat(self.all_preds)
+        if len(self.all_preds) == 0:
+            return torch.tensor(float("nan"))
+
+        preds = torch.cat(self.all_preds)
         targets = torch.cat(self.all_targets)
-        groups = torch.cat(self.all_groups)
 
-        eps_pred = smoothed_edf(predictions, groups, self.num_classes)
-        eps_data = smoothed_edf(targets, groups, self.num_classes)
+        priv_classes = self.privileged_classes.to(targets.device)
+        unpriv_classes = self.unprivileged_classes.to(targets.device)
 
-        return (eps_pred - eps_data).data
+        is_privileged = torch.isin(targets, priv_classes)
+        is_unprivileged = torch.isin(targets, unpriv_classes)
+
+        if not (is_privileged.any() and is_unprivileged.any()):
+            return torch.tensor(float("nan"))
+
+        # Drop samples whose class is in neither group
+        # TODO: if not priv, unpriv? 
+        keep = is_privileged | is_unprivileged
+        outcomes = (preds == targets)[keep].long()   # 1 = correct
+        groups = is_privileged[keep].long()          # 1 = privileged
+
+        return smoothed_edf(
+            outcomes, groups, num_classes=2, concentration=self.concentration
+        )
 
 
