@@ -250,10 +250,6 @@ def test_run_classification(
     assert "n_examples" in metrics_dict
     assert "n_correct" in metrics_dict
     assert metrics_dict["n_examples"] == 2
-    assert "accu" in metrics_dict
-    assert (
-        metrics_dict["accu"] == metrics_dict["n_correct"] / metrics_dict["n_examples"]
-    )
     assert loss == 1.42
 
 
@@ -563,3 +559,32 @@ def test_scheduler_step(mock_model, backprop_phase):
 
     phase.run_step(mock_model, StepContext(global_step=0, step_in_phase=0))
     assert scheduler_steps == 1, "Scheduler should step exactly once per training step"
+
+
+def test_accuracy_is_the_fraction_correct_over_the_whole_epoch(mock_loss):
+    """Accuracy is n_correct / n_examples, not a mean of the running accuracy."""
+
+    class PredictsClassZero(torch.nn.Module):
+        def forward(self, x, **kwargs):
+            logits = torch.zeros(len(x), 2)
+            logits[:, 0] = 1.0
+            return {"logits": logits}
+
+    dataset = [
+        {"img": torch.zeros(3, 4, 4), "target": target}
+        for target in torch.tensor([0, 0, 1, 1, 1])
+    ]
+    phase = ClassificationInferencePhase(
+        name="eval",
+        dataloader=torch.utils.data.DataLoader(dataset, batch_size=2),
+        device=torch.device("cpu"),
+        loss=mock_loss,
+    )
+
+    metrics = phase.run_step(
+        PredictsClassZero(), StepContext(global_step=0, step_in_phase=0)
+    )
+
+    # The running accuracy after each batch is 1.0, 0.5 and 0.4; their mean is 0.633.
+    assert metrics["accuracy"] == pytest.approx(0.4)
+    assert metrics["accu"] == pytest.approx(0.4)

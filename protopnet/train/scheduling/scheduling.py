@@ -17,9 +17,11 @@ from ...model_losses import ProtoPNetLoss
 from ...prototypical_part_model import ProtoPNet
 from ...utilities.trainer_utilities import get_learning_rates, init_or_update
 from ..metrics import TrainingMetrics
+from .lr_schedules import PhaseRestartingLR
 from .types import (
     PostForwardCalculation,
     PostPhaseSummary,
+    PrePhaseSummary,
     SetTrainingLayers,
     StepContext,
 )
@@ -360,13 +362,6 @@ class ClassificationInferencePhase(_NoGradPhaseMixin):
         for loss_term_item, value in loss_term_dict.items():
             init_or_update(epoch_metrics_dict, loss_term_item, value)
 
-        init_or_update(
-            epoch_metrics_dict,
-            "accu",
-            float(epoch_metrics_dict["n_correct"])
-            / float(epoch_metrics_dict["n_examples"]),
-        )
-
         return output, loss
 
     def _pre_dataloader_step_init(self, model: ProtoPNet, step_context: StepContext):
@@ -417,7 +412,6 @@ class ClassificationInferencePhase(_NoGradPhaseMixin):
             "cluster",
             "separation",
             "fine_annotation",
-            "accu",
         ]
 
         for k, v in epoch_metrics_dict.items():
@@ -437,7 +431,9 @@ class ClassificationInferencePhase(_NoGradPhaseMixin):
 
                 final_metrics[k] = value
 
-        final_metrics["accuracy"] = final_metrics["accu"]
+        # Accuracy of the whole epoch: correct predictions / examples
+        accuracy = final_metrics["n_correct"] / final_metrics["n_examples"]
+        final_metrics["accu"] = final_metrics["accuracy"] = accuracy
 
         return final_metrics
 
@@ -594,7 +590,11 @@ class ClassificationBackpropPhase(ClassificationInferencePhase):
         loss: ProtoPNetLoss,
         optimizer: torch.optim.Optimizer,
         extra_training_metrics: Optional[TrainingMetrics] = None,
-        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        scheduler: Optional[
+            Union[torch.optim.lr_scheduler._LRScheduler, PhaseRestartingLR]
+        ] = None,
+
+
         set_training_layers_fn: SetTrainingLayers = TrainOptimizerLayers(),
         num_accumulation_batches: int = 1,
         post_forward_calculations: Optional[Tuple[PostForwardCalculation]] = None,
@@ -620,7 +620,9 @@ class ClassificationBackpropPhase(ClassificationInferencePhase):
         return self._optimizer
 
     @property
-    def scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
+    def scheduler(
+        self,
+    ) -> Optional[Union[torch.optim.lr_scheduler._LRScheduler, PhaseRestartingLR]]:
         return self._scheduler
 
     @property
@@ -630,6 +632,25 @@ class ClassificationBackpropPhase(ClassificationInferencePhase):
     @property
     def num_accumulation_batches(self) -> int:
         return self._num_accumulation_batches
+        
+        
+        
+    def before_training(
+        self,
+        model: ProtoPNet,
+        metric_logger: TrainLogger,
+        checkpointer: ModelCheckpointer,
+        pre_phase_summary: PrePhaseSummary,
+    ) -> None:
+        """
+        Restarts a PhaseRestartingLR schedule at the start of each occurrence of this
+        phase. Other schedulers carry on where the previous occurrence stopped.
+        """
+        if isinstance(self.scheduler, PhaseRestartingLR):
+            num_epochs = (
+                pre_phase_summary.expected_last_step - pre_phase_summary.first_step + 1
+            )
+            self.scheduler.start_phase(num_epochs)
 
     @contextmanager
     def phase_settings(self, model: ProtoPNet):

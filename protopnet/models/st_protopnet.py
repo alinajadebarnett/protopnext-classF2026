@@ -503,7 +503,6 @@ class STProtoPNetClassificationPhase(ClassificationInferencePhase):
             "cluster",
             "separation",
             "fine_annotation",
-            "accu",
             "l1",
             "discrimination_loss",
             "closeness_loss",
@@ -539,7 +538,9 @@ class STProtoPNetClassificationPhase(ClassificationInferencePhase):
 
                 final_metrics[k] = value
 
-        final_metrics["accuracy"] = final_metrics["accu"]
+        # Accuracy of the whole epoch: correct predictions / examples
+        accuracy = final_metrics["n_correct"] / final_metrics["n_examples"]
+        final_metrics["accu"] = final_metrics["accuracy"] = accuracy
 
         return final_metrics
 
@@ -625,14 +626,6 @@ class STProtoPNetClassificationPhase(ClassificationInferencePhase):
 
         # at this point we have 'trivial/loss.name' ...
         init_or_update(epoch_metrics_dict, sub_model_name + "n_batches", 1)
-
-        # do not prepend sub_model since this was calculated with the joint model
-        init_or_update(
-            epoch_metrics_dict,
-            "accu",
-            float(epoch_metrics_dict["n_correct"])
-            / float(epoch_metrics_dict["n_examples"]),
-        )
 
         # FIXME: should we be passing the joint output here?
         return output, loss

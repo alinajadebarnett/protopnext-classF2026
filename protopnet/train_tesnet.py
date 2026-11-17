@@ -7,7 +7,7 @@ import torch
 from . import datasets
 from .activations import lookup_activation
 from .backbones import construct_backbone, default_batch_sizes_for_backbone
-from .cli import common_training_options
+from .cli import common_training_options, joint_lr_schedule_option
 from .embedding import AddonLayers
 from .losses import ClassAwareExtraCalculations
 from .model_losses import loss_for_coefficients
@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 
 @click.command("train-tesnet")
 @common_training_options
+@joint_lr_schedule_option
 def run(
     *,
     backbone="resnet50[pretraining=inaturalist]",
@@ -30,6 +31,7 @@ def run(
     phase_multiplier=1,
     latent_dim_multiplier_exp=None,
     joint_lr_step_size=5,
+    joint_lr_schedule="step",
     post_project_phases=20,
     joint_epochs_per_phase=5,
     last_only_epochs_per_phase=10,
@@ -64,6 +66,7 @@ def run(
     - phase_multiplier: int - for each phase, multiply the number of epochs in that phase by this number
     - latent_dim_multiplier_exp: int - expotential of 2 for the latent dimension of the prototype layer
     - joint_lr_step_size: int - number of epochs between each step in the joint learning rate scheduler. Multiplied by phase_multiplier.
+    - joint_lr_schedule: str - "step" (default), "step-reset" or "cosine". See ProtoPNetTrainingSchedule.
     - last_only_epochs_per_phase: int - coefficient for clustering loss
     - post_project_phases: int - number of times to iterate between last-only, joint, project after the initial pre-project phases
     - cluster_coef: float - coefficient for clustering loss term
@@ -187,6 +190,7 @@ def run(
         weight_decay=1e-3,
         joint_lr_step_size=joint_lr_step_size * phase_multiplier,
         joint_lr_step_gamma=lr_step_gamma,
+        joint_lr_schedule=joint_lr_schedule,
         last_only_epochs_per_project=last_only_epochs_per_phase * phase_multiplier,
         joint_epochs_per_phase=joint_epochs_per_phase * phase_multiplier,
         post_project_phases=post_project_phases,

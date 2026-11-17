@@ -2,8 +2,24 @@ import logging
 
 import click
 
+
+
+from .train.scheduling.lr_schedules import JOINT_LR_SCHEDULES
+
 log = logging.getLogger(__name__)
 
+# For models trained with ProtoPNetTrainingSchedule (ProtoPNet and TesNet).
+joint_lr_schedule_option = click.option(
+    "--joint-lr-schedule",
+    type=click.Choice(JOINT_LR_SCHEDULES),
+    default="step",
+    show_default=True,
+    help=(
+        "Learning-rate schedule of the joint phases. 'step' keeps decaying from one "
+        "joint phase to the next (original ProtoPNet); 'step-reset' restarts the step "
+        "decay in every joint phase; 'cosine' anneals the rate within every joint phase."
+    ),
+)
 
 def common_training_options(f):
     """Common options for training commands."""

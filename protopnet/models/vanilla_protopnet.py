@@ -8,6 +8,7 @@ from ..embedding import EmbeddedBackbone
 from ..prediction_heads import LinearClassPrototypePredictionHead
 from ..prototype_layers import ClassAwarePrototypeLayer
 from ..prototypical_part_model import ProtoPNet
+from ..train.scheduling.lr_schedules import joint_lr_scheduler
 from ..train.scheduling.scheduling import (
     ClassificationBackpropPhase,
     ClassificationInferencePhase,
@@ -82,6 +83,7 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
         weight_decay: float = 1e-3,
         joint_lr_step_size: int = 5,
         joint_lr_step_gamma: float = 0.1,
+        joint_lr_schedule: str = "step",
         last_only_epochs_per_project: int = 20,
         joint_epochs_per_phase: int = 10,
         post_project_phases: int = 12,
@@ -101,6 +103,11 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
             - num_preproject_joint_epochs: how many joint (end-to-end) training epochs before the first project phase
             - ...
             - joint_lr_step_size: number of epochs for each learning rate step down
+            - joint_lr_schedule: how the joint learning rate changes over training; one of
+                "step" (default: decays across all joint phases, as in the original ProtoPNet),
+                "step-reset" (the step decay restarts in every joint phase) or
+                "cosine" (cosine annealing within every joint phase).
+                See train.scheduling.lr_schedules.
             - last_only_epochs_per_project: epochs after project where most features are frozen, only the prediction head trains
             - joint_epochs_per_phase: number of joint (end-to-end) training epochs before each projection step after warmups
             - post_project_phases: how many times to loop (last-only epochs -> joint (end-to-end) epochs -> project epochs) after the first project
@@ -166,7 +173,8 @@ class ProtoPNetTrainingSchedule(TrainingSchedule):
         joint = ClassificationBackpropPhase(
             name="joint",
             optimizer=joint_optimizer,
-            scheduler=torch.optim.lr_scheduler.StepLR(
+            scheduler=joint_lr_scheduler(
+                joint_lr_schedule,
                 joint_optimizer,
                 step_size=joint_lr_step_size,
                 gamma=joint_lr_step_gamma,
