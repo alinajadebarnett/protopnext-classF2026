@@ -11,7 +11,7 @@ from torchmetrics.classification import (
     MulticlassROC,
 )
 
-from ..metrics import PartConsistencyScore, PartStabilityScore, add_gaussian_noise
+from ..metrics import PartConsistencyScore, PartStabilityScore, add_gaussian_noise, DisparateImpact, EqualOpportunityDifference, DifferentialFairness
 from ..prototypical_part_model import ProtoPNet
 from ..utilities.trainer_utilities import predicated_extend
 
@@ -70,6 +70,28 @@ class TrainingMetrics:
             raise NotImplementedError("This method must be implemented in a subclass.")
 
         # otherwise, do nothing, which is fine
+
+class NullMetrics(TrainingMetrics):
+    """
+    This is a null class for training metrics, if no metrics need to be run. 
+
+    All methods pass, or return an empty dict from the parent class.
+    """
+
+    def __init__(self, device: None):
+        super().__init__(metrics=[], device=device)
+    
+    def start_epoch(self, phase: str):
+        pass
+    
+    def end_epoch(self, phase: str):
+        pass
+
+    def reset(self):
+        pass
+    
+    def update_all(self, forward_args: dict, forward_outputs: dict, phase: str):
+        pass
 
 
 class InterpretableTrainingMetrics(TrainingMetrics):
@@ -403,3 +425,58 @@ class InterpretableTrainingMetrics(TrainingMetrics):
         )
 
         return result_dict
+
+class FairnessTrainingMetrics(TrainingMetrics):
+    """
+    Implementation of fairness metrics for training. 
+    It includes DisparateImpact, EqualOpportunityDifference, and DifferentialFairness metrics.
+    """
+    def __init__(
+        self,
+        num_classes,
+        privileged_classes, 
+        unprivileged_classes,
+        concentration=1.0,
+        device="cpu",
+    ):
+        """
+        Args:
+            num_classes (int): The number of classes in the dataset.
+            priviledged_classes (list): numerical list of the priviledged classes, corresponding to the class lables
+            unprivileged_classes (list): numerical list of the unpriviledged classes, corresponding to the class lables
+            concentration (float, optional): The concentration parameter for DifferentialFairness. Defaults to 1.0.
+            device (str or torch.device, optional): The device to run the metrics on. Defaults to "cpu".
+        """
+        super().__init__(
+            metrics=[
+                TrainingMetric(
+                    name="disparate_impact",
+                    metric=DisparateImpact(
+                        num_classes, privileged_classes, unprivileged_classes,
+                    ),
+                ),
+                TrainingMetric(
+                    name="equal_opportunity_difference",
+                    metric=EqualOpportunityDifference(
+                        num_classes, privileged_classes, unprivileged_classes,
+                    ),
+                ),
+                TrainingMetric(
+                    name="differential_fairness",
+                    metric=DifferentialFairness(
+                        num_classes, privileged_classes, unprivileged_classes, concentration
+                    ),
+                ),
+            ],
+            device=device,
+        )
+
+    def update_all(self, forward_args: dict, forward_outputs: dict, phase: str):
+        """
+        Update all the fairness metrics.
+        """
+        for training_metric in self.metrics.values():
+            training_metric.metric.update(
+                logits=forward_outputs["logits"],
+                targets=forward_args["target"],
+            )

@@ -4,7 +4,7 @@ import logging
 import click
 import torch
 
-from protopnet.train.metrics import InterpretableTrainingMetrics
+from protopnet.train.metrics import InterpretableTrainingMetrics, FairnessTrainingMetrics
 
 from . import datasets
 from .activations import lookup_activation
@@ -196,6 +196,8 @@ def run(
             "device": setup["device"],
             "post_forward_calculations": post_forward_calculations,
         },
+        # TODO: here is where you define which metrics to use. 
+        # if needed, add a way to implement both interp and fair metrics. 
         extra_training_metrics=InterpretableTrainingMetrics(
             num_classes=split_dataloaders.num_classes,
             proto_per_class=vppn.prototype_layer.num_prototypes_per_class,

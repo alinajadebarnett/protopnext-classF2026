@@ -14,6 +14,9 @@ from protopnet.metrics import (
     PartConsistencyScore,
     PartStabilityScore,
     add_gaussian_noise,
+    DisparateImpact,
+    EqualOpportunityDifference,
+    DifferentialFairness
 )
 from protopnet.models.vanilla_protopnet import VanillaProtoPNet
 from protopnet.preprocess import mean, std
@@ -362,3 +365,126 @@ def test_pcs_perfect_score(
         score = pcs.compute()
 
     assert score == 1.0
+
+@pytest.mark.parametrize(
+    "logits, targets, expected_di, expected_eod",
+    [
+        # Equal accuracy: DI = 1.0, EOD = 0
+        (
+            [[5, 0], [0, 5], [5, 0], [0, 5]],
+            [0, 1, 0, 1],
+            1.0, 0.0
+        ),
+        # Unprivileged accuracy = 0.5, privileged accuracy = 1.0
+        # DI = 0.5, EOD = -0.5
+        (
+            [[5, 0], [0, 5], [5, 0], [5, 0]],
+            [0, 1, 0, 1],
+            0.5, -0.5
+        ),
+        # Unprivileged accuracy = 1.0, privileged accuracy = 0.5
+        # DI = 2.0, EOD = 0.5
+        (
+            [[5, 0], [0, 5], [0, 5], [0, 5]],
+            [0, 1, 1, 0],
+            2.0, 0.5
+        ),
+    ],
+)
+def test_fairness_metrics(
+    logits, targets, expected_di, expected_eod
+):
+    di = DisparateImpact(
+        num_classes=2,
+        privileged_classes=[0],
+        unprivileged_classes=[1],
+    )
+
+    eod = EqualOpportunityDifference(
+        num_classes=2,
+        privileged_classes=[0],
+        unprivileged_classes=[1],
+    )
+
+    logits = torch.tensor(logits, dtype=torch.float32)
+    targets = torch.tensor(targets)
+
+    di.update(logits, targets)
+    di_score = di.compute()
+
+    eod.update(logits, targets)
+    eod_score = eod.compute()
+
+    assert di_score == pytest.approx(expected_di)
+    assert eod_score == pytest.approx(expected_eod)
+
+
+@pytest.mark.parametrize(
+    "logits, targets, concentration, expected_score",
+    [
+        # Identical outcome distributions
+        (
+            [[5, 0], [0, 5], [5, 0], [0, 5]],
+            [0, 1, 0, 1],
+            1.0, 0.0
+        ),
+        # Different outcome distributions
+        (
+            [[5, 0], [5, 0], [0, 5], [5, 0]],
+            [0, 0, 1, 1],
+            1.0, 1.0985
+        ),
+    ],
+)
+def test_differential_fairness(
+    logits, targets, concentration, expected_score
+):
+    df = DifferentialFairness(
+        num_classes=2,
+        privileged_classes=[0],
+        unprivileged_classes=[1],
+        concentration=concentration,
+    )
+
+    logits = torch.tensor(logits, dtype=torch.float32)
+    targets = torch.tensor(targets)
+
+    df.update(logits, targets)
+    score = df.compute()
+    assert score == expected_score
+
+
+@pytest.mark.parametrize(
+    "metric_class",
+    [
+        DisparateImpact,
+        EqualOpportunityDifference,
+        DifferentialFairness,
+    ],
+)
+@pytest.mark.parametrize(
+    "targets",
+    [
+        [0, 0, 0],  # Only privileged group
+        [1, 1, 1],  # Only unprivileged group
+    ],
+)
+def test_fairness_missing_group(metric_class, targets):
+    metric = metric_class(
+        num_classes=2,
+        privileged_classes=[0],
+        unprivileged_classes=[1],
+    )
+
+    logits = torch.tensor([
+        [5, 0],
+        [5, 0],
+        [5, 0],
+    ], dtype=torch.float32)
+
+    targets = torch.tensor(targets)
+
+    metric.update(logits, targets)
+    score = metric.compute()
+
+    assert torch.isnan(torch.as_tensor(score))
