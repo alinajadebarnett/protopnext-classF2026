@@ -1,0 +1,39 @@
+# ProtoPNet training schedule: the same schedule `train-protopnet` uses by default.
+# Copy this file, edit it, and run:
+#   python -m protopnet train-protopnet --schedule-config my_schedule.yaml
+# Add --dry-run to print the resulting schedule without training.
+#
+# Components: backbone, add_on_layers, prototype_layer, prototype_prediction_head
+# Anything you delete from this file falls back to the same default.
+
+# Settings for each training stage.
+#   trainable: components that learn in this stage (all others are frozen)
+#   lr:        learning rate per component in this stage; components not listed use
+#              their normal rate (backbone 1e-4, add_on_layers 3e-3,
+#              prototype_layer 3e-3, prototype_prediction_head 1e-4,
+#              each scaled by --lr-multiplier). Rates set here are used as written.
+stages:
+  warm:
+    trainable: [add_on_layers, prototype_layer]
+  joint:
+    trainable: [backbone, add_on_layers, prototype_layer]
+  last_only:
+    trainable: [prototype_prediction_head]
+
+# true = BatchNorm running statistics stay fixed in frozen components.
+freeze_batchnorm: false
+
+# Order in which stages run. Epochs are multiplied by --phase-multiplier.
+#   {stage: <name>, epochs: <n>}     one stage (warm, joint or last_only); 0 skips it
+#   {stage: project}                 replace prototypes with real training patches
+#   {repeat: <n>, stages: [...]}     run a list of stages n times (cannot be nested)
+schedule:
+  - {stage: warm, epochs: 5}
+  - {stage: joint, epochs: 5}
+  - {stage: project}
+  - repeat: 20
+    stages:
+      - {stage: last_only, epochs: 10}
+      - {stage: joint, epochs: 5}
+      - {stage: project}
+  - {stage: last_only, epochs: 10}

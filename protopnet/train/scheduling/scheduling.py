@@ -108,14 +108,128 @@ class TrainOptimizerLayers:
         and otherwise does not set any layers to be trainable.
         """
         optimizer = phase.optimizer
+
+        # A real torch optimizer stores parameter tensors, so membership is checked
+        # by tensor identity across all param groups. Parameter-name strings are
+        # still accepted for backwards compatibility.
+        train_all = False
+        optimizer_param_ids = set()
+        optimizer_param_names = set()
+        for group in optimizer.param_groups:
+            group_params = group["params"]
+            if group_params is None:
+                train_all = True
+                continue
+            for p in group_params:
+                if isinstance(p, str):
+                    optimizer_param_names.add(p)
+                else:
+                    optimizer_param_ids.add(id(p))
+
         for name, param in model.named_parameters():
-            if (
-                optimizer.param_groups[0]["params"] is None
-                or name in optimizer.param_groups[0]["params"]
-            ):
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+            param.requires_grad = (
+                train_all
+                or name in optimizer_param_names
+                or id(param) in optimizer_param_ids
+            )
+
+
+#: Top-level ProtoPNet components that can be frozen or trained by name.
+PROTOPNET_COMPONENTS = (
+    "backbone",
+    "add_on_layers",
+    "prototype_layer",
+    "prototype_prediction_head",
+)
+
+
+@dataclass(frozen=True)
+class TrainLayersByComponent:
+    """
+    SetTrainingLayers implementation that trains or freezes whole model components.
+
+    A component is a top-level child module of the model (``backbone``,
+    ``add_on_layers``, ``prototype_layer``, ``prototype_prediction_head``).
+    Parameters of the components listed in ``trainable`` get ``requires_grad=True``;
+    all other parameters are frozen.
+
+    Args:
+        trainable: names of the components to train.
+        freeze_batchnorm: if True, BatchNorm layers inside frozen components are put in
+            eval mode so their running statistics do not change. ``requires_grad=False``
+            alone does not stop BatchNorm statistics from updating. The original mode is
+            restored by ``ClassificationBackpropPhase.phase_settings`` after the phase.
+        strict: if True, raise ``ValueError`` when ``trainable`` names a component the
+            model does not have (catches typos).
+
+    Example:
+        >>> TrainLayersByComponent(trainable=("add_on_layers", "prototype_layer"))
+        >>> TrainLayersByComponent.from_flags(backbone=False, prototype_layer=True)
+    """
+
+    trainable: Tuple[str, ...]
+    freeze_batchnorm: bool = False
+    strict: bool = True
+
+    def __post_init__(self):
+        # a single string like "backbone" is almost always a mistake
+        if isinstance(self.trainable, str):
+            raise TypeError(
+                "trainable must be a collection of component names, not a single string"
+            )
+        # store as a sorted tuple so the frozen dataclass stays hashable
+        object.__setattr__(self, "trainable", tuple(sorted(set(self.trainable))))
+
+    @classmethod
+    def from_flags(
+        cls, *, freeze_batchnorm: bool = False, strict: bool = True, **flags: bool
+    ) -> "TrainLayersByComponent":
+        """Build from ``component=True/False`` keyword flags."""
+        return cls(
+            trainable=tuple(name for name, train in flags.items() if train),
+            freeze_batchnorm=freeze_batchnorm,
+            strict=strict,
+        )
+
+    @staticmethod
+    def _component_of(param_name: str) -> str:
+        # "backbone.layer1.weight" -> "backbone"
+        return param_name.split(".")[0]
+
+    def _model_components(self, model: torch.nn.Module) -> Set[str]:
+        return {self._component_of(name) for name, _ in model.named_parameters()}
+
+    def set_training_layers(self, model: ProtoPNet, phase: Any = None) -> None:
+        # catch typos such as "backbon"
+        if self.strict:
+            unknown = set(self.trainable) - self._model_components(model)
+            if unknown:
+                raise ValueError(
+                    f"Unknown component(s) {sorted(unknown)} in trainable. "
+                    f"Model components are {sorted(self._model_components(model))}."
+                )
+
+        # train listed components, freeze the rest
+        for name, param in model.named_parameters():
+            param.requires_grad = self._component_of(name) in self.trainable
+
+        # requires_grad=False does not stop BatchNorm running stats from changing,
+        # so put BatchNorm layers of frozen components in eval mode
+        if self.freeze_batchnorm:
+            for name, module in model.named_modules():
+                if not name or self._component_of(name) in self.trainable:
+                    continue
+                if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+
+    def describe(self, model: Optional[torch.nn.Module] = None) -> Dict[str, bool]:
+        """Map each component to whether it is trained, e.g. for logging."""
+        components = (
+            sorted(self._model_components(model))
+            if model is not None
+            else sorted(set(PROTOPNET_COMPONENTS) | set(self.trainable))
+        )
+        return {c: c in self.trainable for c in components}
 
 
 @dataclass(frozen=True)
@@ -637,6 +751,9 @@ class ClassificationBackpropPhase(ClassificationInferencePhase):
             name: (param, param.requires_grad)
             for name, param in model.named_parameters()
         }
+        # set_training_layers may switch some modules to eval mode (e.g. frozen
+        # BatchNorm), so remember each module's mode and restore it afterwards.
+        initial_modes = [(module, module.training) for module in model.modules()]
         try:
             assert (
                 torch.is_grad_enabled()
@@ -646,3 +763,5 @@ class ClassificationBackpropPhase(ClassificationInferencePhase):
         finally:
             for _, (param, requires_grad) in initial_states.items():
                 param.requires_grad = requires_grad
+            for module, was_training in initial_modes:
+                module.training = was_training

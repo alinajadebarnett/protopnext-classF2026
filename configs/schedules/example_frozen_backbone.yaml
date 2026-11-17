@@ -1,0 +1,27 @@
+# Example: keep the backbone frozen for the whole run, fine-tune the add-on layers
+# in the last-layer stages with a small learning rate, and use a shorter schedule.
+#   python -m protopnet train-protopnet --schedule-config configs/schedules/example_frozen_backbone.yaml
+
+stages:
+  warm:
+    trainable: [add_on_layers, prototype_layer]
+    lr: {add_on_layers: 0.003, prototype_layer: 0.003}
+  joint:
+    trainable: [add_on_layers, prototype_layer]   # backbone stays frozen
+    lr: {add_on_layers: 0.001}
+  last_only:
+    trainable: [prototype_prediction_head, add_on_layers]
+    lr: {add_on_layers: 0.0005}
+
+freeze_batchnorm: true   # frozen backbone keeps its BatchNorm statistics
+
+schedule:
+  - {stage: warm, epochs: 3}
+  - {stage: joint, epochs: 5}
+  - {stage: project}
+  - repeat: 5
+    stages:
+      - {stage: last_only, epochs: 5}
+      - {stage: joint, epochs: 3}
+      - {stage: project}
+  - {stage: last_only, epochs: 15}
