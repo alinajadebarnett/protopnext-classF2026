@@ -204,6 +204,9 @@ def run(
             img_size=None,
             half_size=None,
             protopnet=vppn,
+            fine_annotation=bool(
+                fa_coef
+            ),  # activation precision follows the fine-annotation loss
             device=setup["device"],
         ),
     )
