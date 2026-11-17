@@ -396,6 +396,8 @@ class FairnessMetrics(Metric):
     Base class for fairness metrics.
     This class wraps the torchmetrics.Metric class and provides a common interface for fairness metrics. 
 
+    A positive outcome is defined as a correct prediction. 
+
     Attributes:
     - num_classes (int): The number of classes in the dataset.
     - dist_sync_on_step (bool): torchmetrics parameter.
