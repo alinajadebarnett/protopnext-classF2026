@@ -2,7 +2,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from torch import nn
 
 from protopnet.train.metrics import InterpretableTrainingMetrics
 
@@ -190,7 +189,7 @@ class TestInterpretableTrainingMetrics:
         self,
         spatial_perturbation
     ):
-        class SpatialProtoPNetMock(nn.Module):
+        class SpatialProtoPNetMock(torch.nn.Module):
             class PrototypeLayer:
                 prototype_class_identity = torch.tensor(
                     [[1.0, 0.0], [0.0, 1.0]]
@@ -283,7 +282,7 @@ class TestInterpretableTrainingMetrics:
             )
 
     def test_compute_dict_updates_spatial_results_when_metrics_are_cached(self):
-        class SpatialProtoPNetMock(nn.Module):
+        class SpatialProtoPNetMock(torch.nn.Module):
             class PrototypeLayer:
                 prototype_class_identity = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
 
