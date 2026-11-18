@@ -142,6 +142,24 @@ def shapes_2d_squeezenet1_1_path(temp_root_dir):
         return file
 
 
+@pytest.fixture(scope="package")
+def shapes_2d_squeezenet1_1_protopool_path(temp_root_dir):
+    run_id = "test_shapes_2d_squeezenet1_1_protopool"
+    run_dir = temp_root_dir.resolve() / "inttest" / "artifacts" / "runs" / run_id
+
+    stdout, _ = python(
+        f"-u -m protopnet train-protopool --dataset=shapes_2d --backbone=squeezenet1_1 --verify --run-id={run_id}",
+        {
+            "WANDB_MODE": "dryrun",
+            "PPNXT_ARTIFACT_DIR": str(temp_root_dir / "inttest" / "artifacts"),
+        },
+    )
+    assert_epoch_training(stdout, ["warm", "joint", "project", "last_only", "prune"])
+
+    for file in run_dir.glob(f"{run_id}_best@*_project_*.pth"):
+        return file
+
+
 @contextmanager
 def disable_exception_traceback():
     """

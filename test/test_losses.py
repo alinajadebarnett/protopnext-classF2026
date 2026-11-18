@@ -21,10 +21,17 @@ from protopnet.losses import (
     FineAnnotationCost,
     GrassmannianOrthogonalityLoss,
     L1CostClassConnectionLayer,
+    MixupCrossEntropyCost,
     OrthogonalityLoss,
+    ProtoPoolClusterCost,
+    ProtoPoolSeparationCost,
     SeparationCost,
+    SlotOrthogonalityLoss,
 )
-from protopnet.prediction_heads import LinearClassPrototypePredictionHead
+from protopnet.prediction_heads import (
+    LinearClassPrototypePredictionHead,
+    ProtoPoolPredictionHead,
+)
 from protopnet.prototype_layers import ClassAwarePrototypeLayer, PrototypeLayer
 from protopnet.prototypical_part_model import ProtoPNet
 
@@ -1565,3 +1572,128 @@ def test_calculation_edge_cases(calculator, mock_model):
         expected_incorrect_activations,
         rtol=1e-5,
     )
+
+
+def _original_dist_loss(max_dist, min_distances, proto_presence, top_k):
+    """dist_loss from gmum/ProtoPool main.py"""
+    basic_proto = proto_presence.sum(dim=-1).detach()  # [b, p]
+    _, idx = torch.topk(basic_proto, top_k, dim=1)  # [b, n]
+    binarized_top_k = torch.zeros_like(basic_proto)
+    binarized_top_k.scatter_(1, src=torch.ones_like(basic_proto), index=idx)  # [b, p]
+    inverted_distances, _ = torch.max(
+        (max_dist - min_distances) * binarized_top_k, dim=1
+    )  # [b]
+    return torch.mean(max_dist - inverted_distances)
+
+
+def _original_orthogonality(proto_presence):
+    """orthogonality loss from gmum/ProtoPool main.py"""
+    num_classes, _, num_descriptive = proto_presence.shape
+    orthogonal_loss = torch.Tensor([0])
+    for c in range(0, proto_presence.shape[0], 1000):
+        orthogonal_loss += torch.nn.functional.cosine_similarity(
+            proto_presence.unsqueeze(2)[c : c + 1000],
+            proto_presence.unsqueeze(-1)[c : c + 1000],
+            dim=1,
+        ).sum()
+    return orthogonal_loss / (num_descriptive * num_classes) - 1
+
+
+@pytest.fixture
+def protopool_soft_batch():
+    torch.manual_seed(0)
+    num_classes, num_prototypes, num_descriptive, max_dist = 4, 9, 2, 64
+    proto_presence = torch.softmax(
+        torch.randn(num_classes, num_prototypes, num_descriptive), dim=1
+    )
+    min_distances = torch.rand(6, num_prototypes) * max_dist
+    target = torch.tensor([0, 1, 2, 3, 1, 2])
+    return proto_presence, min_distances, target, max_dist
+
+
+def test_protopool_cluster_cost_matches_original(protopool_soft_batch):
+    proto_presence, min_distances, target, max_dist = protopool_soft_batch
+    expected = _original_dist_loss(
+        max_dist, min_distances, proto_presence[target], proto_presence.shape[-1]
+    )
+    cost = ProtoPoolClusterCost()(
+        min_distances=min_distances, proto_presence=proto_presence, target=target
+    )
+    assert torch.allclose(cost, expected)
+
+
+def test_protopool_separation_cost_matches_original(protopool_soft_batch):
+    proto_presence, min_distances, target, max_dist = protopool_soft_batch
+    num_prototypes, num_descriptive = proto_presence.shape[1:]
+    expected = _original_dist_loss(
+        max_dist,
+        min_distances,
+        1 - proto_presence[target],
+        num_prototypes - num_descriptive,
+    )
+    cost = ProtoPoolSeparationCost()(
+        min_distances=min_distances, proto_presence=proto_presence, target=target
+    )
+    assert torch.allclose(cost, expected)
+
+
+def test_protopool_cluster_cost_dedups_hard_assignment():
+    # class 0 uses prototype 1 in both slots; top-k(2) would pull in an unrelated prototype
+    proto_presence = torch.zeros(1, 4, 2)
+    proto_presence[0, 1, :] = 1
+    min_distances = torch.tensor([[0.5, 3.0, 0.1, 5.0]])
+    target = torch.tensor([0])
+
+    cluster = ProtoPoolClusterCost()(
+        min_distances=min_distances, proto_presence=proto_presence, target=target
+    )
+    separation = ProtoPoolSeparationCost()(
+        min_distances=min_distances, proto_presence=proto_presence, target=target
+    )
+    assert cluster.item() == pytest.approx(3.0)
+    assert separation.item() == pytest.approx(0.1)
+
+
+def test_slot_orthogonality_matches_original():
+    torch.manual_seed(0)
+    head = ProtoPoolPredictionHead(num_classes=5, num_prototypes=7, num_descriptive=3)
+    model = Mock()
+    model.prototype_prediction_head = head
+
+    loss = SlotOrthogonalityLoss()(model)
+    expected = _original_orthogonality(head.proto_presence.detach())
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_slot_orthogonality_zero_for_orthogonal_slots():
+    head = ProtoPoolPredictionHead(num_classes=2, num_prototypes=4, num_descriptive=2)
+    with torch.no_grad():
+        head.proto_presence.zero_()
+        head.proto_presence[:, 0, 0] = 1
+        head.proto_presence[:, 1, 1] = 1
+    model = Mock()
+    model.prototype_prediction_head = head
+    assert SlotOrthogonalityLoss()(model).item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_mixup_cross_entropy():
+    cost = MixupCrossEntropyCost()
+    logits = torch.randn(4, 3)
+    target = torch.tensor([0, 1, 2, 0])
+    target_b = torch.tensor([1, 1, 0, 2])
+
+    assert torch.allclose(cost(logits, target), F.cross_entropy(logits, target))
+    assert torch.allclose(
+        cost(logits, target, mixup_target_b=target_b, mixup_lambda=0.3),
+        0.3 * F.cross_entropy(logits, target) + 0.7 * F.cross_entropy(logits, target_b),
+    )
+
+
+def test_l1_uses_slot_class_identity_for_protopool():
+    head = ProtoPoolPredictionHead(num_classes=2, num_prototypes=3, num_descriptive=2)
+    with torch.no_grad():
+        head.class_connection_layer.weight.fill_(1.0)
+    model = Mock()
+    model.prototype_prediction_head = head
+    # 2 classes x 4 slots, of which 2 per class are off-class
+    assert L1CostClassConnectionLayer()(model).item() == pytest.approx(4.0)

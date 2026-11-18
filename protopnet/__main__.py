@@ -78,6 +78,7 @@ from . import (  # noqa: E402
     pacmap,
     train_deformable,
     train_protopnet,
+    train_protopool,
     train_prototree,
     train_support_trivial,
     train_tesnet,
@@ -90,6 +91,7 @@ cli.add_command(train_protopnet.run)
 cli.add_command(train_deformable.run)
 cli.add_command(train_tesnet.run)
 cli.add_command(train_prototree.run)
+cli.add_command(train_protopool.run)
 cli.add_command(train_support_trivial.run)
 cli.add_command(visualization.run)
 cli.add_command(pacmap.run)

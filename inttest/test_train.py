@@ -25,6 +25,11 @@ def test_train_deformable():
     )
 
 
+def test_train_protopool(shapes_2d_squeezenet1_1_protopool_path):
+    # the fixture trains with --verify and checks the warm, joint, project, last_only, prune phases
+    assert shapes_2d_squeezenet1_1_protopool_path is not None
+
+
 def test_train_tesnet():
     stdout, _ = python(
         "-u -m protopnet train-tesnet --verify --dataset=shapes_2d --backbone=squeezenet1_1",

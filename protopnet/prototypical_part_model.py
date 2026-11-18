@@ -105,6 +105,10 @@ class ProtoPNet(nn.Module):
         prototype_similarities = prototype_layer_output_dict["prototype_activations"]
         if "offsets" in prototype_layer_output_dict:
             kwargs["offsets"] = prototype_layer_output_dict["offsets"]
+        if "prototype_distances" in prototype_layer_output_dict:
+            kwargs["prototype_distances"] = prototype_layer_output_dict[
+                "prototype_distances"
+            ]
 
         prediction_logits = self.prototype_prediction_head(
             prototype_similarities, **kwargs
@@ -441,6 +445,21 @@ class ProtoPNet(nn.Module):
 
     def get_prototype_class_identity(self, label) -> torch.Tensor:
         return self.prototype_layer.prototype_class_identity[:, label]
+
+    def class_major_prototype_activations(
+        self, prototype_activations: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Returns prototype activations laid out class-major, i.e. (batch, num_classes * metric_prototypes_per_class(), H, W),
+        as expected by the part stability and consistency metrics.
+        """
+        return prototype_activations
+
+    def metric_prototypes_per_class(self) -> int:
+        """
+        The number of prototypes per class in the layout returned by `class_major_prototype_activations`.
+        """
+        return self.prototype_layer.num_prototypes_per_class
 
     def input_channels(self) -> torch.Tensor:
         """

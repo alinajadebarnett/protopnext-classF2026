@@ -12,10 +12,14 @@ from .losses import (
     GrassmannianOrthogonalityLoss,
     L1CostClassConnectionLayer,
     LossTerm,
+    MixupCrossEntropyCost,
     NegativeLogLikelihoodCost,
     OffsetL2Cost,
     OrthogonalityLoss,
+    ProtoPoolClusterCost,
+    ProtoPoolSeparationCost,
     SeparationCost,
+    SlotOrthogonalityLoss,
 )
 from .prototypical_part_model import ProtoPNet
 
@@ -44,6 +48,9 @@ class LinearBatchLoss(nn.Module):
             current_loss_args = {
                 req: kwargs[req] for req in loss_component.loss.required_forward_results
             }
+            for opt in getattr(loss_component.loss, "optional_forward_results", ()):
+                if opt in kwargs:
+                    current_loss_args[opt] = kwargs[opt]
 
             current_loss_without_weight = loss_component.loss(**current_loss_args)
 
@@ -239,7 +246,36 @@ def loss_for_coefficients(
             )
         )
 
+    if coefs.get("mixup_cross_entropy", False):
+        batch_losses.append(
+            LossTerm(
+                loss=MixupCrossEntropyCost(), coefficient=coefs["mixup_cross_entropy"]
+            )
+        )
+
+    if coefs.get("protopool_cluster", False):
+        batch_losses.append(
+            LossTerm(
+                loss=ProtoPoolClusterCost(), coefficient=coefs["protopool_cluster"]
+            )
+        )
+
+    if coefs.get("protopool_separation", False):
+        batch_losses.append(
+            LossTerm(
+                loss=ProtoPoolSeparationCost(),
+                coefficient=coefs["protopool_separation"],
+            )
+        )
+
     model_losses = []
+
+    if coefs.get("slot_orthogonality", False):
+        model_losses.append(
+            LossTerm(
+                loss=SlotOrthogonalityLoss(), coefficient=coefs["slot_orthogonality"]
+            )
+        )
 
     if coefs.get("l1", False):
         model_losses.append(

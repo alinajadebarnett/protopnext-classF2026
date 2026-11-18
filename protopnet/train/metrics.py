@@ -307,6 +307,15 @@ class InterpretableTrainingMetrics(TrainingMetrics):
         conf_mat = self.metrics["conf_mat"].metric
         conf_mat.update(preds=forward_outputs["logits"], target=forward_args["target"])
 
+    def _class_major_activations(self, prototype_activations: torch.Tensor):
+        """
+        Lays out prototype activations class-major (num_classes * proto_per_class), as the part metrics expect.
+        """
+        class_major = getattr(self.protopnet, "class_major_prototype_activations", None)
+        if class_major is None:
+            return prototype_activations
+        return class_major(prototype_activations)
+
     def update_stability(self, forward_args: dict, forward_outputs: dict):
         """
         Update the stability metric.
@@ -317,10 +326,13 @@ class InterpretableTrainingMetrics(TrainingMetrics):
                 add_gaussian_noise(forward_args["img"], self.generator),
                 return_prototype_layer_output_dict=True,
             )["prototype_activations"].detach()
+            proto_acts_noisy = self._class_major_activations(proto_acts_noisy)
 
         stability = self.metrics["prototype_stability"].metric
         stability.update(
-            proto_acts=forward_outputs["prototype_activations"],
+            proto_acts=self._class_major_activations(
+                forward_outputs["prototype_activations"]
+            ),
             targets=forward_args["target"],
             proto_acts_noisy=proto_acts_noisy,
             sample_parts_centroids=forward_args["sample_parts_centroids"],
@@ -334,7 +346,9 @@ class InterpretableTrainingMetrics(TrainingMetrics):
         consistency = self.metrics["prototype_consistency"].metric
 
         consistency.update(
-            proto_acts=forward_outputs["prototype_activations"],
+            proto_acts=self._class_major_activations(
+                forward_outputs["prototype_activations"]
+            ),
             targets=forward_args["target"],
             sample_parts_centroids=forward_args["sample_parts_centroids"],
             sample_bounding_box=forward_args["sample_bounding_box"],
