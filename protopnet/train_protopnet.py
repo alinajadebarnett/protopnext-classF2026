@@ -13,6 +13,7 @@ from .cli import common_training_options
 from .embedding import AddonLayers
 from .losses import ClassAwareExtraCalculations
 from .model_losses import loss_for_coefficients
+from .models.knn_protopnet import PrototypeProfileKNN
 from .models.vanilla_protopnet import ProtoPNetTrainingSchedule, VanillaProtoPNet
 from .pixel_space import BilinearUpsampleActivations
 from .train.logging.weights_and_biases import WeightsAndBiasesTrainLogger
@@ -23,12 +24,65 @@ from .train.trainer import MultiPhaseProtoPNetTrainer
 log = logging.getLogger(__name__)
 
 
+def _score_profile_knn(
+    *,
+    model,
+    train_loader,
+    test_loader,
+    num_classes: int,
+    k_neighbors: int,
+    device: torch.device,
+) -> None:
+    """
+    Score the trained prototypes with a profile vote.
+
+    Each training image becomes a list of similarities to the learned
+    prototypes. Each test image is classified by the majority label of the
+    nearest lists. The prototype tensors are not replaced.
+    """
+    if k_neighbors < 1:
+        log.info("Skipping profile kNN because k is %s.", k_neighbors)
+        return
+    if test_loader is None:
+        log.info("Skipping profile kNN because this dataset has no test loader.")
+        return
+
+    knn = PrototypeProfileKNN(k_neighbors=k_neighbors)
+    knn.fit(model, train_loader, num_classes=num_classes)
+    metrics = knn.accuracy(model, test_loader, device=device)
+    n_prototypes = int(model.prototype_layer.num_prototypes)
+    log.info(
+        "Profile kNN test accuracy %.4f (%d/%d), k=%d, prototypes=%d",
+        metrics["accuracy"],
+        metrics["n_correct"],
+        metrics["n_examples"],
+        k_neighbors,
+        n_prototypes,
+    )
+    print(
+        "Profile kNN test accuracy: "
+        f"{metrics['accuracy']:.4f} "
+        f"({metrics['n_correct']}/{metrics['n_examples']}), "
+        f"k={k_neighbors}, prototypes={n_prototypes}"
+    )
+
+
 @click.command("train-protopnet")
 @common_training_options
 @click.option(
     "--num-prototypes-per-class",
     type=int,
     default=10,
+)
+@click.option(
+    "--profile-knn-k",
+    type=int,
+    default=5,
+    help=(
+        "After training, score the test set by a majority vote of this many "
+        "nearest training profiles. The learned prototypes stay in place. "
+        "Use 0 to skip the vote."
+    ),
 )
 def run(
     *,
@@ -59,6 +113,7 @@ def run(
     run_id=None,
     activation_function="l2",
     k_for_topk=1,
+    profile_knn_k=5,
 ):
     """
     Train a Vanilla ProtoPNet.
@@ -77,6 +132,7 @@ def run(
     - fa_func: str - one of "serial", "l2", or "square" to indicate which type of fine annotation loss to use. if None, fine annotation is deactivated.
     - fa_coef: float - coefficient for fine annotation loss term
     - num_prototypes_per_class: int - number of prototypes to create for each class
+    - profile_knn_k: int - after training, score the test set with a vote of this many nearest training profiles. The learned prototypes stay in place. 0 skips the vote. Default 5.
     - lr_multiplier: float - multiplier for learning rates. The base values are from protopnet's training.
     - class_specific: boolean - whether to bind prototypes to individual classes or allow them to be distributed unevenly based on training
     - dry_run: bool - Configure the training run, but do not execute it
@@ -247,4 +303,12 @@ def run(
             training_schedule=training_schedule,
             target_metric_name="accuracy",
             early_stopping=ProjectPatienceEarlyStopping(project_patience=2),
+        )
+        _score_profile_knn(
+            model=vppn,
+            train_loader=split_dataloaders.project_loader,
+            test_loader=split_dataloaders.test_loader,
+            num_classes=split_dataloaders.num_classes,
+            k_neighbors=profile_knn_k,
+            device=setup["device"],
         )

@@ -1,6 +1,5 @@
 from typing import List
 
-from .early_stopping import ProjectPatienceEarlyStopping  # noqa F401
 from .scheduling import (  # noqa F401
     ClassificationBackpropPhase,
     ClassificationInferencePhase,
@@ -20,6 +19,15 @@ from .types import (  # noqa F401
     StepContext,
     TrainingSchedule,
 )
+
+
+def __getattr__(name: str):
+    # Loaded on demand so building a model does not import wandb.
+    if name == "ProjectPatienceEarlyStopping":
+        from .early_stopping import ProjectPatienceEarlyStopping
+
+        return ProjectPatienceEarlyStopping
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def repeated(phases: List[Phase], iterations: int) -> IterativePhase:
