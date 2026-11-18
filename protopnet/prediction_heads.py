@@ -94,6 +94,96 @@ class PrototypePredictionHead(LinearClassPrototypePredictionHead):
     pass
 
 
+class KNNPrototypePredictionHead(nn.Module):
+    """
+    Predict a class by a vote of the nearest prototypes.
+
+    Each prototype is one training image and has one class id. For a new image,
+    this head finds the ``k_neighbors`` most similar prototypes and lets each of
+    them vote for its own class. The predicted class is the one with the most votes.
+
+    ``k_neighbors`` is how many training images get to vote. ``k_for_topk`` is a
+    separate, older setting: it only pools similarity across spatial locations
+    inside one prototype before the neighbor vote happens.
+    """
+
+    def __init__(
+        self,
+        prototype_labels: torch.Tensor,
+        num_classes: int,
+        k_neighbors: int = 10,
+        k_for_topk: int = 1,
+    ):
+        super(KNNPrototypePredictionHead, self).__init__()
+
+        # One class id per prototype, in the same order as the prototype tensors.
+        if prototype_labels.ndim != 1:
+            raise ValueError("prototype_labels must be a 1D tensor of class ids.")
+        if k_neighbors < 1:
+            raise ValueError("k_neighbors must be at least 1.")
+
+        self.num_classes = num_classes
+        self.num_prototypes = prototype_labels.shape[0]
+        self.k_neighbors = k_neighbors
+        self.k_for_topk = k_for_topk
+        # A buffer is saved with the model but is not trained.
+        self.register_buffer("prototype_labels", prototype_labels.long())
+
+    def forward(
+        self,
+        prototype_activations: torch.Tensor,
+        **kwargs,
+    ):
+        # prototype_activations: (batch, num_prototypes, height, width).
+        # Flatten the spatial map so each prototype is a list of location scores.
+        _activations = prototype_activations.view(
+            prototype_activations.shape[0], prototype_activations.shape[1], -1
+        )
+
+        # Keep the strongest locations inside each prototype, then average them.
+        # This produces one similarity score per prototype.
+        k_for_topk = min(self.k_for_topk, _activations.shape[-1])
+        topk_activations, _ = torch.topk(_activations, k_for_topk, dim=-1)
+        similarity_score_to_each_prototype = torch.mean(topk_activations, dim=-1)
+
+        # Vote using the closest prototypes. Use every prototype when fewer than
+        # k_neighbors exist, which is normal in small tests.
+        neighbor_k = min(
+            self.k_neighbors, similarity_score_to_each_prototype.shape[-1]
+        )
+        _, neighbor_indices = torch.topk(
+            similarity_score_to_each_prototype, neighbor_k, dim=-1
+        )
+        neighbor_labels = self.prototype_labels[neighbor_indices]
+
+        # one_hot makes a vote vector per neighbor. Averaging those vectors gives
+        # the fraction of neighbors that belong to each class.
+        # Example: labels [0, 0] and 2 classes become logits [1, 0].
+        votes = F.one_hot(neighbor_labels, num_classes=self.num_classes).to(
+            dtype=similarity_score_to_each_prototype.dtype
+        )
+        logits = votes.mean(dim=1)
+
+        # The trainer reads "logits" and predicts the class with the largest value.
+        output_dict = {"logits": logits}
+
+        if (
+            "return_similarity_score_to_each_prototype" in kwargs
+            and kwargs["return_similarity_score_to_each_prototype"]
+        ) or (
+            "return_incorrect_class_prototype_activations" in kwargs
+            and kwargs["return_incorrect_class_prototype_activations"]
+        ):
+            output_dict[
+                "similarity_score_to_each_prototype"
+            ] = similarity_score_to_each_prototype
+
+        if "return_offsets" in kwargs and kwargs["return_offsets"]:
+            output_dict["offsets"] = kwargs["offsets"]
+
+        return output_dict
+
+
 class ProtoTreePredictionHead(nn.Module):
     class Node(nn.Module):
         def __init__(self, index: int):
