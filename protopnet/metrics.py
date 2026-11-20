@@ -1,8 +1,12 @@
 # ====== MODEL AND DATA LOADING ======
+from contextlib import contextmanager
+
 import torch
+import torch.nn.functional as F
 import torch.utils.data
 import torchvision.transforms as transforms
 from torchmetrics import Metric
+from torchmetrics.utilities.data import dim_zero_cat
 
 
 # ======== HELPER FUNCTIONS ========
@@ -358,3 +362,220 @@ class PartStabilityScore(InterpMetrics):
         stability_score = all_proto_stability.mean()
 
         return stability_score
+
+
+# ======== ACTIVATION PRECISION ========
+PERCENTILE = 0.95
+ANNOTATION_KEY = "fine_annotation"
+
+
+def prototype_classes_from_weight(weight):
+    """Prototype j's class: the argmax of its last-layer column if that column's max is > 0,
+    else None (it has no class, e.g. a prototype removed by a Proto-RSet edit)."""
+    w = weight.detach().cpu()  # (classes, prototypes)
+    return {
+        j: (int(w[:, j].argmax()) if w[:, j].max() > 0 else None)
+        for j in range(w.shape[1])
+    }, w
+
+
+def prototype_classes(model):
+    return prototype_classes_from_weight(
+        model.prototype_prediction_head.class_connection_layer.weight
+    )
+
+
+def prototype_display_classes(model):
+    """Each prototype's class, for showing or grouping prototypes: its last-layer class (prototype_classes,
+    the class activation precision uses) and, for a prototype without one (e.g. removed by a Proto-RSet
+    edit), the prototype layer's class identity."""
+    classes, _ = prototype_classes(model)
+    if any(c is None for c in classes.values()):
+        identity = model.prototype_layer.prototype_class_identity.argmax(dim=1).tolist()
+        classes = {j: identity[j] if c is None else c for j, c in classes.items()}
+    return [classes[j] for j in range(len(classes))]
+
+
+def model_device(model):
+    """The device of the model's parameters."""
+    return next(model.parameters()).device
+
+
+@contextmanager
+def eval_mode(model):
+    """Run the model in eval mode, then put it back in the mode it was in."""
+    was_training = model.training
+    model.eval()
+    try:
+        yield
+    finally:
+        model.train(was_training)
+
+
+def given_class_names(dataset, class_names=None):
+    """`class_names`, else the data's own `dataset.classes`, else None."""
+    return class_names if class_names is not None else getattr(dataset, "classes", None)
+
+
+def class_names_from(dataset, num_classes, class_names=None):
+    """Class names: `class_names`, else the data's own `dataset.classes`, else "0".."num_classes-1"."""
+    class_names = given_class_names(dataset, class_names)
+    if class_names is None:
+        return [str(c) for c in range(num_classes)]
+    class_names = list(class_names)
+    if len(class_names) != num_classes:
+        raise ValueError(
+            f"The data has {len(class_names)} class names but the model has {num_classes} classes."
+        )
+    return class_names
+
+
+def annotation_mask(sample):
+    """The batch's or item's "fine_annotation" mask, as a dense tensor. Not validated, like
+    protopnext's fine-annotation loss: use it only when fine annotation is on (fa_coef set).
+    """
+    mask = sample[ANNOTATION_KEY]
+    return mask.to_dense() if mask.is_sparse else mask
+
+
+class ActivationPrecisionScore(Metric):
+    """
+    Activation precision. For every (annotated image, prototype of the image's class) pair, it is
+    the share of the top (1 - percentile) of the prototype's activation map, upsampled to the mask's
+    size, that falls on the annotated region (fine_annotation == 0). Prototype classes come from the
+    last layer (see prototype_classes_from_weight). Images whose mask is all zeros are not annotated
+    and are skipped, as in protopnext's fine-annotation loss.
+
+    compute() returns the model's activation_precision_score (mean over pairs; nan if none).
+    per_class() and per_prototype() give the same pairs broken down by class or by prototype.
+    """
+
+    def __init__(self, percentile=PERCENTILE, dist_sync_on_step=False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.percentile = percentile
+        self.add_state("pair_classes", default=[], dist_reduce_fx="cat")
+        self.add_state("pair_prototypes", default=[], dist_reduce_fx="cat")
+        self.add_state("pair_precisions", default=[], dist_reduce_fx="cat")
+        self._proto_class, self._weight = {}, None
+
+    def update(self, proto_acts, targets, fine_annotation, class_connection_weight):
+        """proto_acts (B, P, h, w); targets (B,); fine_annotation (B, 1, H, W); class_connection_weight (classes, P)."""
+        self._proto_class, self._weight = prototype_classes_from_weight(
+            class_connection_weight
+        )
+        mask = (
+            fine_annotation.to_dense() if fine_annotation.is_sparse else fine_annotation
+        )
+        mask = mask.to(proto_acts.device)
+        has_mask = mask.flatten(1).sum(dim=1) > 0  # all-zero mask = not annotated
+        lesion = (1 - mask) > 0.5  # (B, 1, H, W), True = lesion
+        classes, protos, precisions = [], [], []
+        for i in torch.nonzero(has_mask).flatten().tolist():
+            c = int(targets[i])
+            js = [
+                j for j, k in self._proto_class.items() if k == c
+            ]  # prototype class == image class
+            if not js:
+                continue
+            # upsample only this image's class prototypes (same values, far less memory)
+            acts = F.interpolate(
+                proto_acts[i : i + 1, js],
+                size=mask.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )[0]
+            on_lesion = lesion[i, 0].flatten()
+            for j, act in zip(js, acts):
+                a = act.flatten()
+                top = a >= torch.quantile(a, self.percentile)
+                precisions.append(
+                    (top & on_lesion).sum().item() / max(top.sum().item(), 1)
+                )
+                classes.append(c)
+                protos.append(j)
+        if precisions:
+            self.pair_classes.append(torch.tensor(classes, device=self.device))
+            self.pair_prototypes.append(torch.tensor(protos, device=self.device))
+            self.pair_precisions.append(
+                torch.tensor(precisions, dtype=torch.float, device=self.device)
+            )
+
+    def _pairs(self):
+        if isinstance(self.pair_precisions, list) and not self.pair_precisions:
+            empty = torch.empty(0, dtype=torch.long)
+            return empty, empty, torch.empty(0)
+        return (
+            dim_zero_cat(self.pair_classes).cpu(),
+            dim_zero_cat(self.pair_prototypes).cpu(),
+            dim_zero_cat(self.pair_precisions).cpu(),
+        )
+
+    def compute(self):
+        _, _, precisions = self._pairs()
+        return precisions.mean() if len(precisions) else torch.tensor(float("nan"))
+
+    def per_class(self, num_classes=None):
+        """{class index: (mean precision, number of pairs)} for every class of the model."""
+        classes, _, precisions = self._pairs()
+        if num_classes is None:
+            num_classes = self._weight.shape[0] if self._weight is not None else 0
+        result = {}
+        for c in range(num_classes):
+            p = precisions[classes == c]
+            result[c] = (p.mean().item() if len(p) else float("nan"), len(p))
+        return result
+
+    def per_prototype(self):
+        """{prototype index: (class index, last-layer coefficient, mean precision, number of pairs)}."""
+        _, protos, precisions = self._pairs()
+        result = {}
+        for j in sorted(set(protos.tolist())):
+            p = precisions[protos == j]
+            c = self._proto_class[j]
+            result[j] = (c, float(self._weight[c, j]), p.mean().item(), len(p))
+        return result
+
+
+def activation_precision_score(
+    model, dataloader, device=None, by=None, class_names=None
+):
+    """
+    Activation precision of `model` on `dataloader` (batches with "img", "target", "fine_annotation"),
+    with the model in eval mode (its mode is put back afterwards). `device` defaults to the model's own.
+
+    by=None: the model's score (float). by="class": {class name: (mean, n)} for every class.
+    by="prototype": {prototype: (class name, coef, mean, n)}. Class names come from `class_names`,
+    else the data (`dataloader.dataset.classes`), else class indices. Like protopnext's
+    fine-annotation loss it does not validate the data: use it only when fine annotation is on.
+    """
+    if by not in (None, "class", "prototype"):
+        raise ValueError(f'by must be None, "class" or "prototype", not {by!r}')
+    weight = model.prototype_prediction_head.class_connection_layer.weight
+    device = model_device(model) if device is None else device
+    metric = ActivationPrecisionScore().to(device)
+    updated = False
+    with torch.no_grad(), eval_mode(model):
+        for batch in dataloader:
+            mask = annotation_mask(batch)
+            if not (mask.flatten(1).sum(dim=1) > 0).any():
+                continue  # nothing annotated: skip the model
+            acts = model(
+                batch["img"].to(device), return_prototype_layer_output_dict=True
+            )["prototype_activations"]
+            metric.update(acts, batch["target"], mask, weight)
+            updated = True
+
+    if by is None:
+        return metric.compute().item() if updated else float("nan")
+    names = class_names_from(
+        getattr(dataloader, "dataset", None), weight.shape[0], class_names
+    )
+    if by == "class":
+        return {
+            names[c]: v
+            for c, v in metric.per_class(num_classes=weight.shape[0]).items()
+        }
+    return {
+        j: (names[c], coef, m, n)
+        for j, (c, coef, m, n) in metric.per_prototype().items()
+    }
