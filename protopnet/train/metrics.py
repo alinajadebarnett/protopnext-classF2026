@@ -11,7 +11,12 @@ from torchmetrics.classification import (
     MulticlassROC,
 )
 
-from ..metrics import PartConsistencyScore, PartStabilityScore, add_gaussian_noise
+from ..metrics import (
+    ActivationPrecisionScore,
+    PartConsistencyScore,
+    PartStabilityScore,
+    add_gaussian_noise,
+)
 from ..prototypical_part_model import ProtoPNet
 from ..utilities.trainer_utilities import predicated_extend
 
@@ -88,6 +93,7 @@ class InterpretableTrainingMetrics(TrainingMetrics):
         half_size: 36,
         device: Union[str, torch.device] = "cpu",
         acc_only: bool = False,
+        fine_annotation: bool = False,
     ):
         """
         Args:
@@ -98,6 +104,9 @@ class InterpretableTrainingMetrics(TrainingMetrics):
             img_size (int): The size of the input images.
             half_size (int): The size of the half of the input image. See: metrics.InterpretableMetrics
             device (Union[str, torch.device], optional): The device to run the metrics on. Defaults to "cpu".
+            fine_annotation (bool, optional): Whether fine annotation is on (fa_coef set). If so,
+                activation precision is computed from the batches' "fine_annotation" masks,
+                whatever acc_only is. Defaults to False.
         """
 
         super().__init__(
@@ -184,6 +193,16 @@ class InterpretableTrainingMetrics(TrainingMetrics):
             device=device,
         )
 
+        # Like the fine-annotation loss, activation precision is switched on by fa_coef,
+        # independently of acc_only (training uses acc_only=True).
+        self.fine_annotation = fine_annotation
+        if fine_annotation:
+            activation_precision = TrainingMetric(
+                name="activation_precision", metric=ActivationPrecisionScore()
+            )
+            activation_precision.metric.to(device)
+            self.metrics[activation_precision.name] = activation_precision
+
         self.generator = torch.Generator(device=device)
         self.protopnet = protopnet
 
@@ -215,6 +234,8 @@ class InterpretableTrainingMetrics(TrainingMetrics):
             self.metrics["weighted_auroc"].metric.reset()
             self.metrics["class_aurocs"].metric.reset()
             self.metrics["conf_mat"].metric.reset()
+            if self.fine_annotation:
+                self.metrics["activation_precision"].metric.reset()
 
         if self.protopnet.prototypes_embedded():
             self.prototypes_embedded_any = True
@@ -260,6 +281,12 @@ class InterpretableTrainingMetrics(TrainingMetrics):
                 forward_outputs=forward_outputs,
             )
             self.update_prototype_sparsity()
+
+        if self.fine_annotation:
+            self.update_activation_precision(
+                forward_args=forward_args,
+                forward_outputs=forward_outputs,
+            )
 
     def update_accuracy(self, forward_args: dict, forward_outputs: dict):
         """
@@ -325,6 +352,17 @@ class InterpretableTrainingMetrics(TrainingMetrics):
             proto_acts_noisy=proto_acts_noisy,
             sample_parts_centroids=forward_args["sample_parts_centroids"],
             sample_bounding_box=forward_args["sample_bounding_box"],
+        )
+
+    def update_activation_precision(self, forward_args: dict, forward_outputs: dict):
+        """
+        Update the activation precision metric.
+        """
+        self.metrics["activation_precision"].metric.update(
+            proto_acts=forward_outputs["prototype_activations"],
+            targets=forward_args["target"],
+            fine_annotation=forward_args["fine_annotation"],
+            class_connection_weight=self.protopnet.prototype_prediction_head.class_connection_layer.weight,
         )
 
     def update_consistency(self, forward_args: dict, forward_outputs: dict):
@@ -402,4 +440,22 @@ class InterpretableTrainingMetrics(TrainingMetrics):
             result_dict["prototype_score"] * result_dict["accuracy"]
         )
 
+        return result_dict
+
+    # Activation precision is added to whatever the method above returns (both of its returns),
+    # so that method stays as it was.
+    _compute_dict_without_activation_precision = compute_dict
+
+    def compute_dict(self) -> dict:
+        """
+        Compute all the metrics and return the raw values in a dictionary, plus activation
+        precision when fine annotation is on. Activation precision depends on the last layer,
+        which changes between epochs, so it is never served from the prototype-metric cache.
+        It is a plain float because the trainer's log line prints only Python numbers.
+        """
+        result_dict = self._compute_dict_without_activation_precision()
+        if self.fine_annotation:
+            result_dict["activation_precision"] = float(
+                self.metrics["activation_precision"].metric.compute()
+            )
         return result_dict
